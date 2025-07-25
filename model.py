@@ -8,9 +8,11 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import shap  # type: ignore
 
+PROCESSES = 2
 BASE_DIR = os.getcwd()
 TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
 SUBMISSION_ID_PATH = os.path.join(BASE_DIR, "submission_id.csv")
+TORCH_CACHE_DIR = os.path.join(BASE_DIR, "torch_cache")
 
 
 def compute_factors_torch(df, device):
@@ -155,21 +157,29 @@ class OptimizedModel:
 
     def get_all_symbol_kline(self):
         t0 = datetime.datetime.now()
-        pool = mp.Pool(2)  # use two cores
-        all_symbol_list = self.get_all_symbol_list()
-        if not all_symbol_list:
-            print("No symbols found, exiting.")
-            pool.close()
-            return [], [], [], [], [], [], [], [], [], []
 
-        # get symbol data + indicators
-        df_list = [
-            pool.apply_async(get_single_symbol_kline_data,
-                             (symbol, self.train_data_path, self.device))
-            for symbol in all_symbol_list
-        ]
-        pool.close()
-        pool.join()
+        try:
+            pool = mp.Pool(processes=PROCESSES)  # use two cores
+
+            all_symbol_list = self.get_all_symbol_list()
+            if not all_symbol_list:
+                print("No symbols found, exiting.")
+                pool.close()
+                return [], [], [], [], [], [], [], [], [], []
+
+            # get symbol data + indicators
+            df_list = [
+                pool.apply_async(get_single_symbol_kline_data,
+                                 (symbol, self.train_data_path, self.device))
+                for symbol in all_symbol_list
+            ]
+        except KeyboardInterrupt as e:
+            pool.terminate()
+            raise
+
+        finally:
+            pool.close()
+            pool.join()
 
         loaded_symbols = []
         for async_result, symbol in zip(df_list, all_symbol_list):
