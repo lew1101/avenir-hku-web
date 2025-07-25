@@ -144,6 +144,7 @@ class OptimizedModel:
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.data_cache = {}
         print(f"Using device: {self.device}")
 
     def get_all_symbol_list(self):
@@ -327,7 +328,7 @@ class OptimizedModel:
         df_submit.columns = ['datetime', 'symbol', 'predict_return']
         df_submit = df_submit[df_submit['datetime'] >= self.start_datetime]
         df_submit["id"] = df_submit["datetime"].dt.strftime(
-            "%Y%m%d%H%M%S") + "_" + df_submit["symbol"]
+            "%Y%m%d%H%M%S") + "_" + df_submit["symbol"].astype(str)
         df_submit = df_submit[['id', 'predict_return']]
 
         if os.path.exists(self.submission_id_path):

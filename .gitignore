@@ -1,6 +1,7 @@
 __pycache__
 .mypy_cache
 .venv
+venv/
 
 kline_data
 submission_id.csv
