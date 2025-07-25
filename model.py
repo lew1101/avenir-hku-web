@@ -1,5 +1,5 @@
 import numpy as np
-import pandas as pd
+import pandas as pd  # type: ignore
 import datetime, os, time
 import torch
 import torch.multiprocessing as mp
@@ -7,6 +7,10 @@ import xgboost as xgb  # type: ignore
 from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import shap  # type: ignore
+
+BASE_DIR = os.getcwd()
+TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
+SUBMISSION_ID_PATH = os.path.join(BASE_DIR, "submission_id.csv")
 
 
 def compute_factors_torch(df, device):
@@ -133,8 +137,8 @@ def get_single_symbol_kline_data(symbol, train_data_path, device):
 class OptimizedModel:
 
     def __init__(self):
-        self.train_data_path = "/kaggle/input/avenir-hku-web/kline_data/train_data"
-        self.submission_id_path = "/kaggle/input/avenir-hku-web/submission_id.csv"
+        self.train_data_path = TRAIN_DATA_DIR
+        self.submission_id_path = SUBMISSION_ID_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -403,8 +407,6 @@ class OptimizedModel:
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
 
-    print("Input directory contents:", os.listdir("/kaggle/input/avenir-hku-web/"))
-    print("Train data directory contents:",
-          os.listdir("/kaggle/input/avenir-hku-web/kline_data/train_data"))
+    print("Train data directory contents:", os.listdir(TRAIN_DATA_DIR))
     model = OptimizedModel()
     model.run()
