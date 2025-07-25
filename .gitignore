@@ -1,0 +1,5 @@
+__pycache__
+.mypy_cache
+
+kline_data
+submission_id.csv
