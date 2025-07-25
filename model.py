@@ -273,7 +273,7 @@ class OptimizedModel:
         ],
                          axis=1)
         print(f"Data size before dropna: {len(data)}")
-        data = data.replace([np.inf, -np.inf], np.nan).dropna()
+        data = data.replace([np.inf, -np.inf], np.nan).dropna().reset_index()
         print(f"Data size after dropna: {len(data)}")
 
         X = data[[
