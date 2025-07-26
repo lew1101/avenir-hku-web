@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import shap  # type: ignore
 
-PROCESSES = 2
+PROCESSES = mp.Pool(4)
 BASE_DIR = os.getcwd()
 TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
 SUBMISSION_ID_PATH = os.path.join(BASE_DIR, "submission_id.csv")
@@ -328,7 +328,7 @@ class OptimizedModel:
         df_submit.columns = ['datetime', 'symbol', 'predict_return']
         df_submit = df_submit[df_submit['datetime'] >= self.start_datetime]
         df_submit["id"] = df_submit["datetime"].dt.strftime(
-            "%Y%m%d%H%M%S") + "_" + df_submit["symbol"].astype(str)
+            "%Y%m%d%H%M%S") + "_" + df_submit["symbol"]
         df_submit = df_submit[['id', 'predict_return']]
 
         if os.path.exists(self.submission_id_path):
