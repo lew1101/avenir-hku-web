@@ -143,7 +143,8 @@ class OptimizedModel:
         self.submission_id_path = SUBMISSION_ID_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cpu'
         self.data_cache = {}
         print(f"Using device: {self.device}")
 
@@ -233,6 +234,89 @@ class OptimizedModel:
 
         print(f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}")
         return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr
+    
+    def superior_get_all_symbol_kline(self):
+        t0 = datetime.datetime.now()
+
+        try:
+            pool = mp.Pool(processes=PROCESSES)  # use two cores
+
+            all_symbol_list = self.get_all_symbol_list()
+            if not all_symbol_list:
+                print("No symbols found, exiting.")
+                pool.close()
+                return [], [], [], [], [], [], [], [], [], []
+
+            # get symbol data + indicators
+            df_list = [
+                pool.apply_async(get_single_symbol_kline_data,
+                                 (symbol, self.train_data_path, self.device))
+                for symbol in all_symbol_list
+            ]
+        except KeyboardInterrupt as e:
+            pool.terminate()
+            raise
+
+        finally:
+            pool.close()
+            pool.join()
+
+        loaded_symbols = []
+        for async_result, symbol in zip(df_list, all_symbol_list):
+            df = async_result.get()
+            if not df.empty and 'vwap' in df.columns:
+                loaded_symbols.append(symbol)
+            else:
+                print(f"{symbol} failed: empty or missing 'vwap'")
+        failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
+        print(f"Failed symbols: {failed_symbols}")
+
+        # Clean data
+        time_index = pd.date_range(start=self.start_datetime, end='2024-12-31',
+                                   freq='15min')  # 15 min time index
+        df_results = [async_result.get() for async_result in df_list]
+        df_open_price = pd.concat([
+            result['open_price']
+            for result in df_results
+            if not result.empty and 'open_price' in result.columns
+        ],
+                                  axis=1).sort_index(
+                                      ascending=True)  # get open price dfs for each symbol
+        print(
+            f"df_open_price index dtype: {df_open_price.index.dtype}, shape: {df_open_price.shape}")
+        df_open_price.columns = loaded_symbols
+        df_open_price = df_open_price.reindex(columns=all_symbol_list, fill_value=0).reindex(
+            time_index, method='ffill')  # unify time steps
+        time_arr = pd.to_datetime(df_open_price.index).values
+
+        def align_df(arr, valid_symbols, key):
+            valid_dfs = [
+                df[key]
+                for df, s in zip([i.get() for i in df_list], all_symbol_list)
+                if not df.empty and key in df.columns and s in valid_symbols
+            ]
+            if not valid_dfs:
+                print(f"No valid data for {key}, filling with zeros")
+                return np.zeros((len(time_index), len(all_symbol_list)))
+            df = pd.concat(valid_dfs, axis=1).sort_index(ascending=True)
+            df.columns = valid_symbols
+            return df.reindex(columns=all_symbol_list, fill_value=0).reindex(time_index,
+                                                                             method='ffill').values
+
+        vwap_arr = align_df(df_list, loaded_symbols, 'vwap')
+        amount_arr = align_df(df_list, loaded_symbols, 'amount')
+        atr_arr = align_df(df_list, loaded_symbols, 'atr')
+        macd_arr = align_df(df_list, loaded_symbols, 'macd')
+        buy_volume_arr = align_df(df_list, loaded_symbols, 'buy_volume')
+        volume_arr = align_df(df_list, loaded_symbols, 'volume')
+        rsi_arr = align_df(df_list, loaded_symbols, 'rsi')
+        vwap_deviation_arr = align_df(df_list, loaded_symbols, 'vwap_deviation')
+        print(f"rsi_arr shape: {rsi_arr.shape}, vwap_deviation_arr shape: {vwap_deviation_arr.shape}")
+        
+
+        print(f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}")
+        return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr
+
 
     def weighted_spearmanr(self, y_true, y_pred):
         n = len(y_true)
@@ -249,7 +333,7 @@ class OptimizedModel:
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
 
     def train(self, df_target, df_4h_momentum, df_7d_momentum, df_amount_sum, df_vol_momentum,
-              df_atr, df_macd, df_buy_pressure):
+              df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation):
         factor1_long = df_4h_momentum.stack()
         factor2_long = df_7d_momentum.stack()
         factor3_long = df_amount_sum.stack()
@@ -257,7 +341,11 @@ class OptimizedModel:
         factor5_long = df_atr.stack()
         factor6_long = df_macd.stack()
         factor7_long = df_buy_pressure.stack()
+        factor8_long = df_rsi.stack()
+        factor9_long = df_vwapdeviation.stack()
+
         target_long = df_target.stack()
+        
 
         factor1_long.name = '4h_momentum'
         factor2_long.name = '7d_momentum'
@@ -266,11 +354,13 @@ class OptimizedModel:
         factor5_long.name = 'atr'
         factor6_long.name = 'macd'
         factor7_long.name = 'buy_pressure'
+        factor8_long.name = 'rsi'
+        factor9_long.name = 'vwap_deviation'
         target_long.name = 'target'
 
         data = pd.concat([
             factor1_long, factor2_long, factor3_long, factor4_long, factor5_long, factor6_long,
-            factor7_long, target_long
+            factor7_long, factor8_long, factor9_long, target_long
         ],
                          axis=1)
         print(f"Data size before dropna: {len(data)}")
@@ -279,7 +369,7 @@ class OptimizedModel:
 
         X = data[[
             '4h_momentum', '7d_momentum', 'amount_sum', 'vol_momentum', 'atr', 'macd',
-            'buy_pressure'
+            'buy_pressure', 'rsi', 'vwap_deviation' 
         ]]
         y = data['target'].replace([np.inf, -np.inf], 0)
 
@@ -298,7 +388,7 @@ class OptimizedModel:
 
             model = xgb.XGBRegressor(objective='reg:squarederror',
                                      learning_rate=0.05,
-                                     max_depth=6,
+                                     max_depth=8,
                                      subsample=0.8,
                                      n_estimators=200,
                                      early_stopping_rounds=10,
@@ -358,7 +448,7 @@ class OptimizedModel:
         df_check = df_check[['level_0', 'symbol', 'target']]
         df_check.columns = ['datetime', 'symbol', 'true_return']
         df_check = df_check[df_check['datetime'] >= self.start_datetime]
-        df_check["id"] = df_check["datetime"].dt.strftime("%Y%m%d%H%M%S") + "_" + df_check["symbol"]
+        df_check["id"] = df_check["datetime"].dt.strftime("%Y%m%d%H%M%S") + "_" + df_check["symbol"].astype(str)
         df_check = df_check[['id', 'true_return']]
         df_check.to_csv("check.csv", index=False)
 
@@ -371,7 +461,7 @@ class OptimizedModel:
         shap.summary_plot(shap_values, X.columns)
 
     def run(self):
-        all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr = self.get_all_symbol_kline(
+        all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr = self.superior_get_all_symbol_kline(
         )
         if not all_symbol_list:
             print("No data loaded, exiting.")
@@ -384,6 +474,9 @@ class OptimizedModel:
         df_macd = pd.DataFrame(macd_arr, columns=all_symbol_list, index=time_arr)
         df_buy_volume = pd.DataFrame(buy_volume_arr, columns=all_symbol_list, index=time_arr)
         df_volume = pd.DataFrame(volume_arr, columns=all_symbol_list, index=time_arr)
+        df_vwapdeviation = pd.DataFrame(
+            vwap_deviation_arr, columns=all_symbol_list, index=time_arr)
+        df_rsi = pd.DataFrame(rsi_arr, columns=all_symbol_list, index=time_arr)
 
         windows_1d = 4 * 24 * 1
         windows_7d = 4 * 24 * 7
@@ -412,7 +505,7 @@ class OptimizedModel:
         # TODO: add more factors
 
         self.train(df_24hour_rtn.shift(-windows_1d), df_4h_momentum, df_7d_momentum, df_amount_sum,
-                   df_vol_momentum, df_atr, df_macd, df_buy_pressure)
+                   df_vol_momentum, df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation)
 
 
 if __name__ == '__main__':

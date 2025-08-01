@@ -8,16 +8,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 import shap
 
-PROCESSES = mp.cpu_count()//2
-BASE_DIR = os.getcwd()
-TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
-SUBMISSION_ID_PATH = os.path.join(BASE_DIR, "submission_id.csv")
-CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
-
 class OptimizedModel:
     def __init__(self):
-        self.train_data_path = TRAIN_DATA_DIR
-        self.submission_id_path = SUBMISSION_ID_PATH
+        self.train_data_path = "/kaggle/input/avenir-hku-web/kline_data/train_data"
+        self.submission_id_path = "/kaggle/input/avenir-hku-web/submission_id.csv"
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -142,7 +136,7 @@ class OptimizedModel:
 
     def get_all_symbol_kline(self):
         t0 = datetime.datetime.now()
-        pool = mp.Pool(PROCESSES)
+        pool = mp.Pool(4)
         all_symbol_list = self.get_all_symbol_list()
         if not all_symbol_list:
             print("No symbols found, exiting.")
@@ -354,7 +348,7 @@ class OptimizedModel:
 if __name__ == '__main__':
     # mp.set_start_method('spawn', force=True)
     
-    # print("Input directory contents:", os.listdir("/kaggle/input/avenir-hku-web/"))
-    # print("Train data directory contents:", os.listdir("/kaggle/input/avenir-hku-web/kline_data/train_data"))
+    print("Input directory contents:", os.listdir("/kaggle/input/avenir-hku-web/"))
+    print("Train data directory contents:", os.listdir("/kaggle/input/avenir-hku-web/kline_data/train_data"))
     model = OptimizedModel()
     model.run()
