@@ -255,8 +255,8 @@ class OptimizedModel:
         self.submission_id_path = SUBMISSION_ID_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        # self.device = 'cpu'
+        # self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cpu'
         self.data_cache = {}
         print(f"Using device: {self.device}")
 
