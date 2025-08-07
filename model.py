@@ -469,11 +469,15 @@ class OptimizedModel:
         print("Begin Training model...")
         factors_long = []
         for ind, df in factor_dfs.items():
-            factor = df.stack()
+            factor = df.stack().astype(
+                "float32"
+            )  # Convert to float32 for memory efficiency
             factor.name = ind
             factors_long.append(factor)
 
-        target_long = df_target.stack()
+        target_long = df_target.stack().astype(
+            "float32"
+        )  # Convert to float32 for memory efficiency
         target_long.name = "target"
 
         data = pd.concat(
@@ -483,11 +487,6 @@ class OptimizedModel:
             ],
             axis=1,
         )
-
-        # Convert to float32 to reduce memory usage
-        for col in data.columns:
-            if col != "target":
-                data[col] = data[col].astype("float32")
 
         print(f"Data size before dropna: {len(data)}")
         # data = data.replace([np.inf, -np.inf], np.nan)
@@ -500,8 +499,8 @@ class OptimizedModel:
 
         for i in range(0, len(data), chunk_size):
             chunk = data.iloc[i : i + chunk_size].copy()
-            chunk = chunk.replace([np.inf, -np.inf], np.nan)
-            chunk = chunk.dropna()
+            chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
+            chunk.dropna(inplace=True)
             processed_chunks.append(chunk)
             print(
                 f"Processed chunk {i//chunk_size + 1}/{(len(data)-1)//chunk_size + 1}"
@@ -513,7 +512,8 @@ class OptimizedModel:
             f"Final memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
         )
 
-        X = data[factors_long]
+        factor_names = list(factor_dfs.keys())
+        X = data[factor_names]
         y = data["target"].replace([np.inf, -np.inf], 0)
 
         X_scaled = self.scaler.fit_transform(X)  # stadardize features by z-score
@@ -563,7 +563,8 @@ class OptimizedModel:
         print(f"Best validation Spearman score: {best_score:.4f}")
 
         data["y_pred"] = best_model.predict(X_scaled)
-        data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
+        data["y_pred"].replace([np.inf, -np.inf], 0, inplace=True)
+        data["y_pred"].fillna(0, inplace=True)
         data["y_pred"] = data["y_pred"].ewm(span=5).mean()
 
         df_submit = data.reset_index(level=0)
@@ -780,7 +781,7 @@ class OptimizedModel:
         df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
 
         raw_factors = [
-            "vwapdeviation",
+            "vwap_deviation",
             "atr",
             "macd",
             "rsi",
