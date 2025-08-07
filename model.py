@@ -465,6 +465,7 @@ class OptimizedModel:
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
 
     def train(self, df_target, factor_dfs):
+        print("Begin Training model...")
         factors_long = []
         for ind, df in factor_dfs.items():
             factor = df.stack()
@@ -515,7 +516,7 @@ class OptimizedModel:
                 n_estimators=500,
                 reg_lambda=1,
                 tree_method="hist",
-                device="cuda",
+                device=self.device,
                 early_stopping_rounds=20,
                 random_state=42,
             )
@@ -530,6 +531,7 @@ class OptimizedModel:
             y_pred_val = model.predict(X_val)
             score = self.weighted_spearmanr(y_val, y_pred_val)
             if score > best_score:
+                print(f"New best score: {score:.4f}")
                 best_score = score
                 best_model = model
 
@@ -666,6 +668,11 @@ class OptimizedModel:
                 raw_dfs[ind].to_parquet(file)
                 print(f"Saved {ind} to cache, shape: {raw_dfs[ind].shape}")
 
+        windows_1d = 4 * 24 * 1
+        windows_7d = 4 * 24 * 7
+        windows_4h = 4 * 4
+        windows_1h = 4
+
         derived_dfs = {}
         if use_derived_cache:
             print(
@@ -686,12 +693,6 @@ class OptimizedModel:
             print(
                 f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
             )
-
-            windows_1d = 4 * 24 * 1
-            windows_7d = 4 * 24 * 7
-            windows_4h = 4 * 4
-            windows_1h = 4
-
             # 1h_momentum
             derived_dfs["1h_momentum"] = (
                 raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
