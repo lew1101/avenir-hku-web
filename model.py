@@ -483,10 +483,30 @@ class OptimizedModel:
             axis=1,
         )
 
+        # Convert to float32 to reduce memory usage
+        for col in data.columns:
+            if col != 'target':
+                data[col] = data[col].astype('float32')
+        
         print(f"Data size before dropna: {len(data)}")
-        data = data.replace([np.inf, -np.inf], np.nan)
-        data.dropna(inplace=True)
+        # data = data.replace([np.inf, -np.inf], np.nan)
+        # data.dropna(inplace=True)
+        # print(f"Data size after dropna: {len(data)}")
+        
+        # Process in chunks to avoid memory issues
+        chunk_size = 1000000  # 1 million rows per chunk
+        processed_chunks = []
+        
+        for i in range(0, len(data), chunk_size):
+            chunk = data.iloc[i:i+chunk_size].copy()
+            chunk = chunk.replace([np.inf, -np.inf], np.nan)
+            chunk = chunk.dropna()
+            processed_chunks.append(chunk)
+            print(f"Processed chunk {i//chunk_size + 1}/{(len(data)-1)//chunk_size + 1}")
+        
+        data = pd.concat(processed_chunks, ignore_index=True)
         print(f"Data size after dropna: {len(data)}")
+        print(f"Final memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
 
         X = data[factors_long]
         y = data["target"].replace([np.inf, -np.inf], 0)
