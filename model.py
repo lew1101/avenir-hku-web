@@ -452,7 +452,7 @@ class OptimizedModel:
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
 
     def train(self, df_target, df_4h_momentum, df_7d_momentum, df_amount_sum, df_vol_momentum,
-              df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum,
+              df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum, df_bb_upper, df_bb_lower,
               df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv):
         factor1_long = df_4h_momentum.stack()
         factor2_long = df_7d_momentum.stack()
@@ -464,12 +464,14 @@ class OptimizedModel:
         factor8_long = df_rsi.stack()
         factor9_long = df_vwapdeviation.stack()
         factor10_long = df_1h_momentum.stack()
-        factor11_long = df_keltner_upper.stack()
-        factor12_long = df_keltner_lower.stack()    
-        factor13_long = df_stochastic_d.stack()
-        factor14_long = df_cci.stack()
-        factor15_long = df_mfi.stack()
-        factor16_long = df_obv.stack()
+        factor11_long = df_bb_upper.stack()
+        factor12_long = df_bb_lower.stack()
+        factor13_long = df_keltner_upper.stack()
+        factor14_long = df_keltner_lower.stack()
+        factor15_long = df_stochastic_d.stack()
+        factor16_long = df_cci.stack()
+        factor17_long = df_mfi.stack()
+        factor18_long = df_obv.stack()
 
 
         target_long = df_target.stack()
@@ -485,19 +487,21 @@ class OptimizedModel:
         factor8_long.name = 'rsi'
         factor9_long.name = 'vwap_deviation'
         factor10_long.name = '1h_momentum'
-        factor11_long.name = 'keltner_upper'
-        factor12_long.name = 'keltner_lower'
-        factor13_long.name = 'stochastic_d'
-        factor14_long.name = 'cci'
-        factor15_long.name = 'mfi'
-        factor16_long.name = 'obv'
+        factor11_long.name = 'bb_upper'
+        factor12_long.name = 'bb_lower'
+        factor13_long.name = 'keltner_upper'
+        factor14_long.name = 'keltner_lower'
+        factor15_long.name = 'stochastic_d'
+        factor16_long.name = 'cci'
+        factor17_long.name = 'mfi'
+        factor18_long.name = 'obv'
 
         target_long.name = 'target'
 
         data = pd.concat([
             factor1_long, factor2_long, factor3_long, factor4_long, factor5_long, factor6_long,
             factor7_long, factor8_long, factor9_long, factor10_long, factor11_long, factor12_long,
-            factor13_long, factor14_long, factor15_long, factor16_long,
+            factor13_long, factor14_long, factor15_long, factor16_long, factor17_long, factor18_long,
             target_long
         ],
                          axis=1)
@@ -510,7 +514,7 @@ class OptimizedModel:
         X = data[[
             '4h_momentum', '7d_momentum', 'amount_sum', 'vol_momentum', 'atr', 'macd',
             'buy_pressure', 'rsi', 'vwap_deviation', '1h_momentum', 'keltner_upper',
-            'keltner_lower', 'stochastic_d', 'cci', 'mfi', 'obv',
+            'keltner_lower', 'stochastic_d', 'cci', 'mfi', 'obv', 'bb_upper', 'bb_lower'
         ]]
         y = data['target'].replace([np.inf, -np.inf], 0)
 
@@ -534,7 +538,7 @@ class OptimizedModel:
                                      n_estimators=500,
                                      reg_lambda=1,
                                      tree_method='hist',
-                                     device = self.device,
+                                     device = 'cuda',
                                      early_stopping_rounds=20,
                                      random_state=42)
             model.fit(X_train,
@@ -669,7 +673,7 @@ class OptimizedModel:
         # 
 
         self.train(df_24hour_rtn.shift(-windows_1d), df_4h_momentum, df_7d_momentum, df_amount_sum,
-                   df_vol_momentum, df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum, df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv)
+                   df_vol_momentum, df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum, df_bb_upper,df_bb_lower, df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv)
 
 
 if __name__ == '__main__':
