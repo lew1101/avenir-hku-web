@@ -150,6 +150,14 @@ def compute_factors_torch(df, device):
         ema26[i] = alpha26 * close[i] + (1 - alpha26) * ema26[i - 1]
     macd = ema12 - ema26
     macd = torch.where(torch.isnan(macd), torch.tensor(0.0, device=device), macd)
+    
+    # Signal line (9-period EMA of MACD)
+    signal_line = torch.zeros_like(macd, device=device)
+    signal_alpha = 2 / (9 + 1)
+    signal_line[:9] = macd[:9].mean()
+    for i in range(9, len(macd)):
+        signal_line[i] = signal_alpha * macd[i] + (1 - signal_alpha) * signal_line[i - 1]
+        
 
     # Keltner Channels 
     ## Volatility-based bands around a moving average
@@ -161,9 +169,6 @@ def compute_factors_torch(df, device):
     keltner_lower = ema12 - (atr * keltner_multiplier)
     keltner_upper = torch.where(torch.isfinite(keltner_upper), keltner_upper, close)
     keltner_lower = torch.where(torch.isfinite(keltner_lower), keltner_lower, close)
-    # Remove manual padding since tensors should already have correct length
-    # keltner_upper = torch.nn.functional.pad(keltner_upper, (19, 0), mode='constant', value=0)
-    # keltner_lower = torch.nn.functional.pad(keltner_lower, (19, 0), mode='constant', value=0)
     
     
     # Buy Ratio
@@ -233,55 +238,55 @@ def compute_factors_torch(df, device):
     ## SAR = SAR[i-1] + AF * (EP - SAR[i-1])
     ## AF = Acceleration Factor, EP = Extreme Point
     ## Used to identify potential reversals in price direction
-    af = 0.02  # Acceleration Factor
-    max_af = 0.2  # Maximum AF
-    psar = torch.zeros_like(close, device=device)
-    ep = torch.zeros_like(close, device=device)  # Extreme Point
-    trend = torch.zeros_like(close, device=device)  # 1 for uptrend, -1 for downtrend
+    # af = 0.02  # Acceleration Factor
+    # max_af = 0.2  # Maximum AF
+    # psar = torch.zeros_like(close, device=device)
+    # ep = torch.zeros_like(close, device=device)  # Extreme Point
+    # trend = torch.zeros_like(close, device=device)  # 1 for uptrend, -1 for downtrend
     
-    # Initialize
-    psar[0] = low[0]
-    ep[0] = high[0]
-    trend[0] = 1
+    # # Initialize
+    # psar[0] = low[0]
+    # ep[0] = high[0]
+    # trend[0] = 1
     
-    for i in range(1, len(close)):
-        if trend[i-1] == 1:  # Uptrend
-            psar[i] = psar[i-1] + af * (ep[i-1] - psar[i-1])
-            if high[i] > ep[i-1]:
-                ep[i] = high[i]
-                af = min(af + 0.02, max_af)
-            else:
-                ep[i] = ep[i-1]
-                af = 0.02
+    # for i in range(1, len(close)):
+    #     if trend[i-1] == 1:  # Uptrend
+    #         psar[i] = psar[i-1] + af * (ep[i-1] - psar[i-1])
+    #         if high[i] > ep[i-1]:
+    #             ep[i] = high[i]
+    #             af = min(af + 0.02, max_af)
+    #         else:
+    #             ep[i] = ep[i-1]
+    #             af = 0.02
             
-            if low[i] < psar[i]:
-                trend[i] = -1
-                psar[i] = ep[i-1]
-                ep[i] = low[i]
-                af = 0.02
-            else:
-                trend[i] = 1
-        else:  # Downtrend
-            psar[i] = psar[i-1] + af * (ep[i-1] - psar[i-1])
-            if low[i] < ep[i-1]:
-                ep[i] = low[i]
-                af = min(af + 0.02, max_af)
-            else:
-                ep[i] = ep[i-1]
-                af = 0.02
+    #         if low[i] < psar[i]:
+    #             trend[i] = -1
+    #             psar[i] = ep[i-1]
+    #             ep[i] = low[i]
+    #             af = 0.02
+    #         else:
+    #             trend[i] = 1
+    #     else:  # Downtrend
+    #         psar[i] = psar[i-1] + af * (ep[i-1] - psar[i-1])
+    #         if low[i] < ep[i-1]:
+    #             ep[i] = low[i]
+    #             af = min(af + 0.02, max_af)
+    #         else:
+    #             ep[i] = ep[i-1]
+    #             af = 0.02
             
-            if high[i] > psar[i]:
-                trend[i] = 1
-                psar[i] = ep[i-1]
-                ep[i] = high[i]
-                af = 0.02
-            else:
-                trend[i] = -1
+    #         if high[i] > psar[i]:
+    #             trend[i] = 1
+    #             psar[i] = ep[i-1]
+    #             ep[i] = high[i]
+    #             af = 0.02
+    #         else:
+    #             trend[i] = -1
     
-    # Convert to relative position
-    psar_relative = (close - psar) / (close + 1e-8)
-    psar_relative = torch.where(torch.isfinite(psar_relative), psar_relative, torch.tensor(0.0, device=device))
-    psar_relative = torch.clamp(psar_relative, -1, 1)
+    # # Convert to relative position
+    # psar_relative = (close - psar) / (close + 1e-8)
+    # psar_relative = torch.where(torch.isfinite(psar_relative), psar_relative, torch.tensor(0.0, device=device))
+    # psar_relative = torch.clamp(psar_relative, -1, 1)
     
     # CCI - Commodity Channel Index: https://www.investopedia.com/terms/c/cci.asp
     ## Measures deviation of price from its average price over a period
@@ -330,6 +335,7 @@ def compute_factors_torch(df, device):
     df['vwap'] = vwap.cpu().numpy()
     df['rsi'] = rsi.cpu().numpy()
     df['macd'] = macd.cpu().numpy()
+    df['signal_line'] = signal_line.cpu().numpy()
     df['atr'] = atr.cpu().numpy()
     df['buy_ratio'] = buy_ratio.cpu().numpy()
     df['vwap_deviation'] = vwap_deviation.cpu().numpy()
@@ -343,7 +349,6 @@ def compute_factors_torch(df, device):
     df['bb_lower'] = bb_lower.cpu().numpy()
     df['adx'] = adx.cpu().numpy()
     df['williams_r'] = williams_r.cpu().numpy()
-    df['psar_relative'] = psar_relative.cpu().numpy()
     df['bb_deviation'] = bb_deviation.cpu().numpy()
     
     return df
@@ -388,8 +393,8 @@ class OptimizedModel:
         self.submission_id_path = SUBMISSION_ID_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        # self.device = 'cpu'
+        # self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cpu'
         self.data_cache = {}
         print(f"Using device: {self.device}")
 
@@ -564,9 +569,9 @@ class OptimizedModel:
         cci_arr = align_df(df_list, loaded_symbols, 'cci')
         mfi_arr = align_df(df_list, loaded_symbols, 'mfi')
         obv_arr = align_df(df_list, loaded_symbols, 'obv')
+        signal_line_arr = align_df(df_list, loaded_symbols, 'signal_line')
         adx_arr = align_df(df_list, loaded_symbols, 'adx')
         williams_r_arr = align_df(df_list, loaded_symbols, 'williams_r')
-        psar_relative_arr = align_df(df_list, loaded_symbols, 'psar_relative')
         bb_deviation_arr = align_df(df_list, loaded_symbols, 'bb_deviation')
         
         # Cross-sectional features (market-relative indicators)
@@ -584,7 +589,7 @@ class OptimizedModel:
         
 
         print(f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}")
-        return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr, adx_arr, williams_r_arr, psar_relative_arr, bb_deviation_arr
+        return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr, signal_line_arr, adx_arr, williams_r_arr, bb_deviation_arr
 
 
     def weighted_spearmanr(self, y_true, y_pred):
@@ -603,7 +608,7 @@ class OptimizedModel:
 
     def train(self, df_target, df_4h_momentum, df_7d_momentum, df_amount_sum, df_vol_momentum,
               df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum,
-              df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv, df_adx, df_williams_r, df_psar_relative, df_bb_deviation, df_bb_lower, df_bb_upper, df_rsi_vs_market, df_macd_vs_market, df_volume_vs_market):
+              df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv, df_signal_line, df_adx, df_williams_r, df_bb_deviation, df_bb_lower, df_bb_upper):
         factor1_long = df_4h_momentum.stack()
         factor2_long = df_7d_momentum.stack()
         factor3_long = df_amount_sum.stack()
@@ -620,15 +625,12 @@ class OptimizedModel:
         factor14_long = df_cci.stack()
         factor15_long = df_mfi.stack()
         factor16_long = df_obv.stack()
-        factor17_long = df_adx.stack()
-        factor18_long = df_williams_r.stack()
-        factor19_long = df_psar_relative.stack()
+        factor17_long = df_signal_line.stack()
+        factor18_long = df_adx.stack()
+        factor19_long = df_williams_r.stack()
         factor20_long = df_bb_deviation.stack()
         factor21_long = df_bb_lower.stack()
         factor22_long = df_bb_upper.stack()
-        factor23_long = df_rsi_vs_market.stack()
-        factor24_long = df_macd_vs_market.stack()
-        factor25_long = df_volume_vs_market.stack()
 
         target_long = df_target.stack()
         
@@ -649,23 +651,19 @@ class OptimizedModel:
         factor14_long.name = 'cci'
         factor15_long.name = 'mfi'
         factor16_long.name = 'obv'
-        factor17_long.name = 'adx'
-        factor18_long.name = 'williams_r'
-        factor19_long.name = 'psar_relative'
+        factor17_long.name = 'signal_line'
+        factor18_long.name = 'adx'
+        factor19_long.name = 'williams_r'
         factor20_long.name = 'bb_deviation'
         factor21_long.name = 'bb_lower'
         factor22_long.name = 'bb_upper'
-        factor23_long.name = 'rsi_vs_market'
-        factor24_long.name = 'macd_vs_market'
-        factor25_long.name = 'volume_vs_market'
         target_long.name = 'target'
 
         data = pd.concat([
             factor1_long, factor2_long, factor3_long, factor4_long, factor5_long, factor6_long,
             factor7_long, factor8_long, factor9_long, factor10_long, factor11_long, factor12_long,
-            factor13_long, factor14_long, factor15_long, factor16_long, factor17_long, factor18_long, factor19_long,
-            factor20_long, factor21_long, factor22_long, factor23_long, factor24_long, factor25_long,
-            target_long
+            factor13_long, factor14_long, factor15_long, factor16_long, factor17_long, factor18_long,
+            factor19_long, factor20_long, factor21_long, factor22_long, target_long
         ],
                          axis=1)
         
@@ -695,8 +693,8 @@ class OptimizedModel:
         X = data[[
             '4h_momentum', '7d_momentum', 'amount_sum', 'vol_momentum', 'atr', 'macd',
             'buy_pressure', 'rsi', 'vwap_deviation', '1h_momentum', 'keltner_upper',
-            'keltner_lower', 'stochastic_d', 'cci', 'mfi', 'obv', 'adx', 'williams_r', 'psar_relative',
-            'bb_deviation', 'bb_lower', 'bb_upper', 'rsi_vs_market', 'macd_vs_market', 'volume_vs_market',
+            'keltner_lower', 'stochastic_d', 'cci', 'mfi', 'obv', 'signal_line', 'adx', 'williams_r',
+            'bb_deviation', 'bb_lower', 'bb_upper'
         ]]
         y = data['target'].replace([np.inf, -np.inf], 0)
 
@@ -714,14 +712,14 @@ class OptimizedModel:
                                      (y_train_clean < y_train_clean.quantile(0.1)), 2, 1)
 
             model = xgb.XGBRegressor(objective='reg:squarederror',
-                                     learning_rate=0.01,
-                                     max_depth=20,
+                                     learning_rate=0.02,
+                                     max_depth=15,
                                      subsample=0.8,
-                                     n_estimators=500,
+                                     n_estimators=300,
                                      reg_lambda=1,
                                      tree_method='hist',
                                      device = self.device,
-                                     early_stopping_rounds=20,
+                                     early_stopping_rounds=15,
                                      random_state=42)
             model.fit(X_train,
                       y_train,
@@ -792,7 +790,7 @@ class OptimizedModel:
         shap.summary_plot(shap_values, X.columns)
 
     def run(self):
-        all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr, adx_arr, williams_r_arr, psar_relative_arr, bb_deviation_arr = self.superior_get_all_symbol_kline(
+        all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr, signal_line_arr, adx_arr, williams_r_arr, bb_deviation_arr = self.superior_get_all_symbol_kline(
         )
         if not all_symbol_list:
             print("No data loaded, exiting.")
@@ -816,9 +814,9 @@ class OptimizedModel:
         df_cci = pd.DataFrame(cci_arr, columns=all_symbol_list, index=time_arr).astype('float32')
         df_mfi = pd.DataFrame(mfi_arr, columns=all_symbol_list, index=time_arr).astype('float32')
         df_obv = pd.DataFrame(obv_arr, columns=all_symbol_list, index=time_arr).astype('float32')
+        df_signal_line = pd.DataFrame(signal_line_arr, columns=all_symbol_list, index=time_arr).astype('float32')
         df_adx = pd.DataFrame(adx_arr, columns=all_symbol_list, index=time_arr).astype('float32')
         df_williams_r = pd.DataFrame(williams_r_arr, columns=all_symbol_list, index=time_arr).astype('float32')
-        df_psar_relative = pd.DataFrame(psar_relative_arr, columns=all_symbol_list, index=time_arr).astype('float32')
         df_bb_deviation = pd.DataFrame(bb_deviation_arr, columns=all_symbol_list, index=time_arr).astype('float32')
 
         windows_1d = 4 * 24 * 1
@@ -849,16 +847,16 @@ class OptimizedModel:
         df_24hour_rtn = (df_vwap / df_vwap.shift(windows_1d) - 1).replace([np.inf, -np.inf],
                                                                           np.nan).fillna(0)
 
-        # Cross-sectional features (market-relative indicators)
-        # These compare each asset to the market average
-        market_rsi = df_rsi.mean(axis=1)
-        market_macd = df_macd.mean(axis=1)
-        market_volume = df_volume.mean(axis=1)
+        # # Cross-sectional features (market-relative indicators)
+        # # These compare each asset to the market average
+        # market_rsi = df_rsi.mean(axis=1)
+        # market_macd = df_macd.mean(axis=1)
+        # market_volume = df_volume.mean(axis=1)
         
-        # Relative strength vs market
-        df_rsi_vs_market = df_rsi.sub(market_rsi, axis=0)
-        df_macd_vs_market = df_macd.sub(market_macd, axis=0)
-        df_volume_vs_market = df_volume.div(market_volume, axis=0)
+        # # Relative strength vs market
+        # df_rsi_vs_market = df_rsi.sub(market_rsi, axis=0)
+        # df_macd_vs_market = df_macd.sub(market_macd, axis=0)
+        # df_volume_vs_market = df_volume.div(market_volume, axis=0)
 
         # TODO: add more factors
 
@@ -867,7 +865,7 @@ class OptimizedModel:
         # 
 
         self.train(df_24hour_rtn.shift(-windows_1d), df_4h_momentum, df_7d_momentum, df_amount_sum,
-                   df_vol_momentum, df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum, df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv, df_adx, df_williams_r, df_psar_relative, df_bb_deviation, df_bb_lower, df_bb_upper, df_rsi_vs_market, df_macd_vs_market, df_volume_vs_market)
+                   df_vol_momentum, df_atr, df_macd, df_buy_pressure, df_rsi, df_vwapdeviation, df_1h_momentum, df_keltner_upper, df_keltner_lower, df_stochastic_d, df_cci, df_mfi, df_obv, df_signal_line, df_adx, df_williams_r, df_bb_deviation, df_bb_lower, df_bb_upper)
 
 
 if __name__ == '__main__':
