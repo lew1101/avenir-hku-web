@@ -5,8 +5,8 @@ shap>=0.44,<0.45            # 0.44.1 OK
 xgboost>=2.0,<2.1           # 2.0.3 OK
 
 # PyTorch with CUDA 12.4
+--extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.6.0+cu124
---index-url https://download.pytorch.org/whl/cu124
 
 fastparquet>=2024.11.0      # current latest version
 pyarrow>=12,<14             # 13.x supports pandas 2.2.x and numpy 1.26
