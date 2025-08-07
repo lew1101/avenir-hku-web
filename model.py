@@ -315,7 +315,7 @@ class OptimizedModel:
         "macd",
         "buy_volume",
         "volume",
-        "vwapdeviation",
+        "vwap_deviation",
         "rsi",
         "bb_upper",
         "bb_lower",
