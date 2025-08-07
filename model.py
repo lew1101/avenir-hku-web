@@ -335,6 +335,7 @@ class OptimizedModel:
         "vol_momentum",
         "buy_pressure",
         "24hour_rtn",
+        "bollinger_width",
     ]
 
     def __init__(self):
@@ -485,35 +486,39 @@ class OptimizedModel:
 
         # Convert to float32 to reduce memory usage
         for col in data.columns:
-            if col != 'target':
-                data[col] = data[col].astype('float32')
-        
+            if col != "target":
+                data[col] = data[col].astype("float32")
+
         print(f"Data size before dropna: {len(data)}")
         # data = data.replace([np.inf, -np.inf], np.nan)
         # data.dropna(inplace=True)
         # print(f"Data size after dropna: {len(data)}")
-        
+
         # Process in chunks to avoid memory issues
         chunk_size = 1000000  # 1 million rows per chunk
         processed_chunks = []
-        
+
         for i in range(0, len(data), chunk_size):
-            chunk = data.iloc[i:i+chunk_size].copy()
+            chunk = data.iloc[i : i + chunk_size].copy()
             chunk = chunk.replace([np.inf, -np.inf], np.nan)
             chunk = chunk.dropna()
             processed_chunks.append(chunk)
-            print(f"Processed chunk {i//chunk_size + 1}/{(len(data)-1)//chunk_size + 1}")
-        
+            print(
+                f"Processed chunk {i//chunk_size + 1}/{(len(data)-1)//chunk_size + 1}"
+            )
+
         data = pd.concat(processed_chunks, ignore_index=True)
         print(f"Data size after dropna: {len(data)}")
-        print(f"Final memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
+        print(
+            f"Final memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
+        )
 
         X = data[factors_long]
         y = data["target"].replace([np.inf, -np.inf], 0)
 
         X_scaled = self.scaler.fit_transform(X)  # stadardize features by z-score
 
-        tscv = TimeSeriesSplit(n_splits=18)
+        tscv = TimeSeriesSplit(n_splits=10)
         best_score = -np.inf
         best_model = None
 
@@ -746,6 +751,8 @@ class OptimizedModel:
             derived_dfs["vol_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["vol_momentum"].fillna(0, inplace=True)
 
+            derived_dfs["bollinger_width"] = raw_dfs["bb_upper"] - raw_dfs["bb_lower"]
+
             # buy pressure
             derived_dfs["buy_pressure"] = raw_dfs["buy_volume"] - (
                 raw_dfs["volume"] - raw_dfs["buy_volume"]
@@ -777,8 +784,6 @@ class OptimizedModel:
             "atr",
             "macd",
             "rsi",
-            "bb_upper",
-            "bb_lower",
             "keltner_upper",
             "keltner_lower",
             "stochastic_d",
@@ -791,6 +796,7 @@ class OptimizedModel:
             "1h_momentum",
             "4h_momentum",
             "7d_momentum",
+            "bollinger_width",
             "amount_sum",
             "vol_momentum",
             "buy_pressure",
