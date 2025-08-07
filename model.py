@@ -8,13 +8,13 @@ import xgboost as xgb  # type: ignore
 from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import shap  # type: ignore
-import copy
 
+DEVICE = "cpu"
 PROCESSES = mp.cpu_count() // 2  # use half of the available CPU cores
 BASE_DIR = os.getcwd()
 TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
+TRAIN_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 SUBMISSION_ID_PATH = os.path.join(BASE_DIR, "submission_id.csv")
-CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 
 
 def compute_factors_torch(df, device):
@@ -343,8 +343,8 @@ class OptimizedModel:
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
         # self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = "cpu"
-        self.data_cache = {}
+        self.device = DEVICE
+        self.cache_dir = TRAIN_CACHE_DIR
         print(f"Using device: {self.device}")
 
     def get_all_symbol_list(self):
@@ -598,8 +598,12 @@ class OptimizedModel:
         shap.summary_plot(shap_values, X.columns)
 
     def run(self):
-        # Separate cache files for raw and derived indicators
+        print("Train data directory contents:", os.listdir(self.train_data_path))
 
+        os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
+        print("Cache directory contents:", os.listdir(self.cache_dir))
+
+        # Separate cache files for raw and derived indicators
         RAW_CACHE_FILES = {
             key: os.path.join(self.cache_dir, f"df_{key}.parquet")
             for key in self.RAW_INDICATORS
@@ -609,8 +613,6 @@ class OptimizedModel:
             key: os.path.join(self.cache_dir, f"df_{key}.parquet")
             for key in self.DERIVED_INDICATORS
         }
-
-        os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
 
         raw_indicator_cache_exists = all(
             os.path.isfile(path) for path in RAW_CACHE_FILES.values()
@@ -767,6 +769,5 @@ class OptimizedModel:
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
-    print("Train data directory contents:", os.listdir(TRAIN_DATA_DIR))
     model = OptimizedModel()
     model.run()
