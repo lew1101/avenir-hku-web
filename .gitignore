@@ -1,15 +1,11 @@
 __pycache__
 .mypy_cache
 .venv
-venv/
+venv
 
 kline_data
+data_cache
+
+*.csv
 submission_id.csv
-check.csv
-submit.csv
-"check.csv" 
-"submit.csv" 
-check.csv
-submit.csv
-check.csv
-submit.csv
+
