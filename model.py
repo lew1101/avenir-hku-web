@@ -467,7 +467,7 @@ class OptimizedModel:
     def train(self, df_target, factor_dfs):
         factors_long = []
         for ind, df in factor_dfs.items():
-            factor = df[ind].stack()
+            factor = df.stack()
             factor.name = ind
             factors_long.append(factor)
 
@@ -684,19 +684,29 @@ class OptimizedModel:
 
         if not use_derived_cache:
             print(
-                f'Cannot find derived indicator cache files in "{self.cache_dir}", loading data from source.'
+                f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
             )
 
             windows_1d = 4 * 24 * 1
             windows_7d = 4 * 24 * 7
             windows_4h = 4 * 4
+            windows_1h = 4
 
+            # 1h_momentum
+            derived_dfs["1h_momentum"] = (
+                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
+            )
+            derived_dfs["1h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            derived_dfs["1h_momentum"].fillna(0, inplace=True)
+
+            # 4h_momentum
             derived_dfs["4h_momentum"] = (
                 raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h) - 1
             )
             derived_dfs["4h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["4h_momentum"].fillna(0, inplace=True)
 
+            # 7d_momentum
             derived_dfs["7d_momentum"] = (
                 raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_7d) - 1
             )
@@ -708,6 +718,7 @@ class OptimizedModel:
             derived_dfs["amount_sum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["amount_sum"].fillna(0, inplace=True)
 
+            # volume momentum
             derived_dfs["vol_momentum"] = (
                 raw_dfs["amount"] / raw_dfs["amount"].shift(windows_1d) - 1
             )
@@ -727,6 +738,12 @@ class OptimizedModel:
             )
             derived_dfs["24hour_rtn"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["24hour_rtn"].fillna(0, inplace=True)
+
+            for ind, df in derived_dfs.items():
+                file = DERIVED_CACHE_FILES[ind]
+                print(f"Saving {ind} to cache, shape: {df.shape}")
+                df.to_parquet(file)
+                print(f"Saved {ind} to cache at {file}")
 
         # TODO: add more factors
 
