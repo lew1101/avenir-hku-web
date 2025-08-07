@@ -77,8 +77,6 @@ def compute_factors_torch(df, device):
     atr = torch.where(torch.isnan(atr), torch.tensor(0.0, device=device),
                       atr)  # set to neutral if nan
 
-
-
     # MACD - Moving Average Convergence Divergence: https://www.investopedia.com/terms/m/macd.asp
     ## Momentum + trend-following indicator widely used to spot trade direction, strength, as well as buy/sell signals
     ema12 = torch.zeros_like(close, device=device)
@@ -127,8 +125,6 @@ def compute_factors_torch(df, device):
     # Remove the manual padding since apply_pool already handles it
     # bb_upper = torch.nn.functional.pad(bb_upper, (19, 0), mode='constant', value=0)
     # bb_lower = torch.nn.functional.pad(bb_lower, (19, 0), mode='constant', value=0)
-
-
     
     # Stochastic Oscillator
     ## Momentum indicator comparing closing price to a range of prices over a period
@@ -150,9 +146,6 @@ def compute_factors_torch(df, device):
     stochastic_d = torch.clamp(stochastic_d, 0, 100)
     
 
-    
-
-    
     # CCI - Commodity Channel Index: https://www.investopedia.com/terms/c/cci.asp
     ## Measures deviation of price from its average price over a period
     ## CCI = (Typical Price - SMA(Typical Price)) / (0.015 * Mean Deviation)
@@ -184,8 +177,6 @@ def compute_factors_torch(df, device):
                                         torch.where(close[i] < close[i-1], -volume[i], torch.tensor(0.0, device=device)))
     obv = torch.where(torch.isfinite(obv), obv, torch.tensor(0.0, device=device))
     obv = torch.clamp(obv, -1e6, 1e6)
-    
-    
     
     # VWAP Deviation
     ## Measure of how far current price is from VWAP
@@ -269,169 +260,170 @@ class OptimizedModel:
             print(f"Error in get_all_symbol_list: {e}")
             return []
 
+    # def get_all_symbol_kline(self):
+    #     t0 = datetime.datetime.now()
+
+    #     try:
+    #         pool = mp.Pool(processes=PROCESSES)  # use two cores
+
+    #         all_symbol_list = self.get_all_symbol_list()
+    #         if not all_symbol_list:
+    #             print("No symbols found, exiting.")
+    #             pool.close()
+    #             return [], [], [], [], [], [], [], [], [], []
+
+    #         # get symbol data + indicators
+    #         df_list = [
+    #             pool.apply_async(get_single_symbol_kline_data,
+    #                              (symbol, self.train_data_path, self.device))
+    #             for symbol in all_symbol_list
+    #         ]
+    #     except KeyboardInterrupt as e:
+    #         pool.terminate()
+    #         raise
+
+    #     finally:
+    #         pool.close()
+    #         pool.join()
+
+    #     loaded_symbols = []
+    #     for async_result, symbol in zip(df_list, all_symbol_list):
+    #         df = async_result.get()
+    #         if not df.empty and 'vwap' in df.columns:
+    #             loaded_symbols.append(symbol)
+    #         else:
+    #             print(f"{symbol} failed: empty or missing 'vwap'")
+    #     failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
+    #     print(f"Failed symbols: {failed_symbols}")
+
+    #     # Clean data
+    #     time_index = pd.date_range(start=self.start_datetime, end='2024-12-31',
+    #                                freq='15min')  # 15 min time index
+    #     df_results = [async_result.get() for async_result in df_list]
+    #     df_open_price = pd.concat([
+    #         result['open_price']
+    #         for result in df_results
+    #         if not result.empty and 'open_price' in result.columns
+    #     ],
+    #                               axis=1).sort_index(
+    #                                   ascending=True)  # get open price dfs for each symbol
+    #     print(
+    #         f"df_open_price index dtype: {df_open_price.index.dtype}, shape: {df_open_price.shape}")
+    #     df_open_price.columns = loaded_symbols
+    #     df_open_price = df_open_price.reindex(columns=all_symbol_list, fill_value=0).reindex(
+    #         time_index, method='ffill')  # unify time steps
+    #     time_arr = pd.to_datetime(df_open_price.index).values
+
+    #     def align_df(arr, valid_symbols, key):
+    #         valid_dfs = [
+    #             df[key]
+    #             for df, s in zip([i.get() for i in df_list], all_symbol_list)
+    #             if not df.empty and key in df.columns and s in valid_symbols
+    #         ]
+    #         if not valid_dfs:
+    #             print(f"No valid data for {key}, filling with zeros")
+    #             return np.zeros((len(time_index), len(all_symbol_list)))
+    #         df = pd.concat(valid_dfs, axis=1).sort_index(ascending=True)
+    #         df.columns = valid_symbols
+    #         return df.reindex(columns=all_symbol_list, fill_value=0).reindex(time_index,
+    #                                                                          method='ffill').values
+
+    #     vwap_arr = align_df(df_list, loaded_symbols, 'vwap')
+    #     amount_arr = align_df(df_list, loaded_symbols, 'amount')
+    #     atr_arr = align_df(df_list, loaded_symbols, 'atr')
+    #     macd_arr = align_df(df_list, loaded_symbols, 'macd')
+    #     buy_volume_arr = align_df(df_list, loaded_symbols, 'buy_volume')
+    #     volume_arr = align_df(df_list, loaded_symbols, 'volume')
+
+    #     print(f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}")
+    #     return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr
+    
     def get_all_symbol_kline(self):
         t0 = datetime.datetime.now()
 
         try:
-            pool = mp.Pool(processes=PROCESSES)  # use two cores
+            pool = mp.Pool(processes=PROCESSES)  # use multi core
 
             all_symbol_list = self.get_all_symbol_list()
             if not all_symbol_list:
                 print("No symbols found, exiting.")
                 pool.close()
                 return [], [], [], [], [], [], [], [], [], []
-
-            # get symbol data + indicators
-            df_list = [
+            
+            promise_list = [
                 pool.apply_async(get_single_symbol_kline_data,
                                  (symbol, self.train_data_path, self.device))
                 for symbol in all_symbol_list
             ]
-        except KeyboardInterrupt as e:
-            pool.terminate()
-            raise
 
-        finally:
-            pool.close()
-            pool.join()
+            loaded_symbols = []
+            df_results = []
+            for async_result, symbol in zip(promise_list, all_symbol_list):
+                df = async_result.get()
+                df_results.append(df)
 
-        loaded_symbols = []
-        for async_result, symbol in zip(df_list, all_symbol_list):
-            df = async_result.get()
-            if not df.empty and 'vwap' in df.columns:
-                loaded_symbols.append(symbol)
-            else:
-                print(f"{symbol} failed: empty or missing 'vwap'")
-        failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
-        print(f"Failed symbols: {failed_symbols}")
-
-        # Clean data
-        time_index = pd.date_range(start=self.start_datetime, end='2024-12-31',
-                                   freq='15min')  # 15 min time index
-        df_results = [async_result.get() for async_result in df_list]
-        df_open_price = pd.concat([
-            result['open_price']
-            for result in df_results
-            if not result.empty and 'open_price' in result.columns
-        ],
-                                  axis=1).sort_index(
-                                      ascending=True)  # get open price dfs for each symbol
-        print(
-            f"df_open_price index dtype: {df_open_price.index.dtype}, shape: {df_open_price.shape}")
-        df_open_price.columns = loaded_symbols
-        df_open_price = df_open_price.reindex(columns=all_symbol_list, fill_value=0).reindex(
-            time_index, method='ffill')  # unify time steps
-        time_arr = pd.to_datetime(df_open_price.index).values
-
-        def align_df(arr, valid_symbols, key):
-            valid_dfs = [
-                df[key]
-                for df, s in zip([i.get() for i in df_list], all_symbol_list)
-                if not df.empty and key in df.columns and s in valid_symbols
-            ]
-            if not valid_dfs:
-                print(f"No valid data for {key}, filling with zeros")
-                return np.zeros((len(time_index), len(all_symbol_list)))
-            df = pd.concat(valid_dfs, axis=1).sort_index(ascending=True)
-            df.columns = valid_symbols
-            return df.reindex(columns=all_symbol_list, fill_value=0).reindex(time_index,
-                                                                             method='ffill').values
-
-        vwap_arr = align_df(df_list, loaded_symbols, 'vwap')
-        amount_arr = align_df(df_list, loaded_symbols, 'amount')
-        atr_arr = align_df(df_list, loaded_symbols, 'atr')
-        macd_arr = align_df(df_list, loaded_symbols, 'macd')
-        buy_volume_arr = align_df(df_list, loaded_symbols, 'buy_volume')
-        volume_arr = align_df(df_list, loaded_symbols, 'volume')
-
-        print(f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}")
-        return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr
-    
-    def superior_get_all_symbol_kline(self):
-        t0 = datetime.datetime.now()
-
-        try:
-            pool = mp.Pool(processes=PROCESSES)  # use two cores
-
-            all_symbol_list = self.get_all_symbol_list()
-            if not all_symbol_list:
-                print("No symbols found, exiting.")
-                pool.close()
-                return [], [], [], [], [], [], [], [], [], []
-
-            # get symbol data + indicators
-            df_list = [
-                pool.apply_async(get_single_symbol_kline_data,
-                                 (symbol, self.train_data_path, self.device))
-                for symbol in all_symbol_list
-            ]
-        except KeyboardInterrupt as e:
-            pool.terminate()
-            raise
-
-        finally:
-            pool.close()
-            pool.join()
-
-        loaded_symbols = []
-        for async_result, symbol in zip(df_list, all_symbol_list):
-            df = async_result.get()
-            if not df.empty and 'vwap' in df.columns:
-                loaded_symbols.append(symbol)
-            else:
-                print(f"{symbol} failed: empty or missing 'vwap'")
-        failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
-        print(f"Failed symbols: {failed_symbols}")
-
-        # Clean data
-        time_index = pd.date_range(start=self.start_datetime, end='2024-12-31',
-                                   freq='15min')  # 15 min time index
-        df_results = [async_result.get() for async_result in df_list]
-        df_open_price = pd.concat([
-            result['open_price']
-            for result in df_results
-            if not result.empty and 'open_price' in result.columns
-        ],
-                                  axis=1).sort_index(
-                                      ascending=True)  # get open price dfs for each symbol
-        print(
-            f"df_open_price index dtype: {df_open_price.index.dtype}, shape: {df_open_price.shape}")
-        df_open_price.columns = loaded_symbols
-        df_open_price = df_open_price.reindex(columns=all_symbol_list, fill_value=0).reindex(
-            time_index, method='ffill')  # unify time steps
-        time_arr = pd.to_datetime(df_open_price.index).values
-
-        def align_df(arr, valid_symbols, key):
-            valid_dfs = [
-                df[key]
-                for df, s in zip([i.get() for i in df_list], all_symbol_list)
-                if not df.empty and key in df.columns and s in valid_symbols
-            ]
-            if not valid_dfs:
-                print(f"No valid data for {key}, filling with zeros")
-                return np.zeros((len(time_index), len(all_symbol_list)))
-            df = pd.concat(valid_dfs, axis=1).sort_index(ascending=True)
-            df.columns = valid_symbols
-            return df.reindex(columns=all_symbol_list, fill_value=0).reindex(time_index,
-                                                                             method='ffill').values
-
-        vwap_arr = align_df(df_list, loaded_symbols, 'vwap')
-        amount_arr = align_df(df_list, loaded_symbols, 'amount')
-        atr_arr = align_df(df_list, loaded_symbols, 'atr')
-        macd_arr = align_df(df_list, loaded_symbols, 'macd')
-        buy_volume_arr = align_df(df_list, loaded_symbols, 'buy_volume')
-        volume_arr = align_df(df_list, loaded_symbols, 'volume')
-        rsi_arr = align_df(df_list, loaded_symbols, 'rsi')
-        vwap_deviation_arr = align_df(df_list, loaded_symbols, 'vwap_deviation')
-        bb_upper_arr = align_df(df_list, loaded_symbols, 'bb_upper')
-        bb_lower_arr = align_df(df_list, loaded_symbols, 'bb_lower')
-        keltner_upper_arr = align_df(df_list, loaded_symbols, 'keltner_upper')
-        keltner_lower_arr = align_df(df_list, loaded_symbols, 'keltner_lower')  
-        stochastic_d_arr = align_df(df_list, loaded_symbols, 'stochastic_d')
-        cci_arr = align_df(df_list, loaded_symbols, 'cci')
-        mfi_arr = align_df(df_list, loaded_symbols, 'mfi')
-        obv_arr = align_df(df_list, loaded_symbols, 'obv')
+                if not df.empty and 'vwap' in df.columns:
+                    loaded_symbols.append(symbol)
+                else:
+                    print(f"{symbol} failed: empty or missing 'vwap'")
+            failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
+            print(f"Failed symbols: {failed_symbols}")
         
+        except KeyboardInterrupt:
+            pool.terminate()
+            raise
+
+        finally:
+            pool.close()
+            pool.join()
+
+        # Clean data
+        time_index = pd.date_range(start=self.start_datetime, end='2024-12-31',
+                                   freq='15min')  # 15 min time index
+        df_open_price = pd.concat([
+            result['open_price']
+            for result in df_results
+            if not result.empty and 'open_price' in result.columns
+        ],
+                                  axis=1).sort_index(
+                                      ascending=True)  # get open price dfs for each symbol
+        print(
+            f"df_open_price index dtype: {df_open_price.index.dtype}, shape: {df_open_price.shape}")
+        df_open_price.columns = loaded_symbols
+        df_open_price = df_open_price.reindex(columns=all_symbol_list, fill_value=0).reindex(
+            time_index, method='ffill')  # unify time steps
+        time_arr = pd.to_datetime(df_open_price.index).values
+
+        def align_df(key):
+            valid_dfs = [
+                df[key]
+                for df, s in zip(df_results, all_symbol_list)
+                if not df.empty and key in df.columns and s in loaded_symbols
+            ]
+            if not valid_dfs:
+                print(f"No valid data for {key}, filling with zeros")
+                return np.zeros((len(time_index), len(all_symbol_list)))
+            df = pd.concat(valid_dfs, axis=1).sort_index(ascending=True)
+            df.columns = loaded_symbols
+            return df.reindex(columns=all_symbol_list, fill_value=0).reindex(time_index,
+                                                                             method='ffill').values
+
+        vwap_arr = align_df('vwap')
+        amount_arr = align_df('amount')
+        atr_arr = align_df('atr')
+        macd_arr = align_df('macd')
+        buy_volume_arr = align_df('buy_volume')
+        volume_arr = align_df('volume')
+        rsi_arr = align_df('rsi')
+        vwap_deviation_arr = align_df('vwap_deviation')
+        bb_upper_arr = align_df('bb_upper')
+        bb_lower_arr = align_df('bb_lower')
+        keltner_upper_arr = align_df('keltner_upper')
+        keltner_lower_arr = align_df('keltner_lower')  
+        stochastic_d_arr = align_df('stochastic_d')
+        cci_arr = align_df('cci')
+        mfi_arr = align_df('mfi')
+        obv_arr = align_df('obv')
 
         print(f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}")
         return all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr
@@ -610,7 +602,7 @@ class OptimizedModel:
         shap.summary_plot(shap_values, X.columns)
 
     def run(self):
-        all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr = self.superior_get_all_symbol_kline(
+        all_symbol_list, time_arr, vwap_arr, amount_arr, atr_arr, macd_arr, buy_volume_arr, volume_arr, rsi_arr, vwap_deviation_arr, bb_upper_arr, bb_lower_arr, keltner_upper_arr, keltner_lower_arr, stochastic_d_arr, cci_arr, mfi_arr, obv_arr = self.get_all_symbol_kline(
         )
         if not all_symbol_list:
             print("No data loaded, exiting.")
