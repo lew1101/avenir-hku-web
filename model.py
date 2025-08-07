@@ -315,7 +315,7 @@ class OptimizedModel:
         "macd",
         "buy_volume",
         "volume",
-        "vwapdeviation",
+        "vwap_deviation",
         "rsi",
         "bb_upper",
         "bb_lower",
@@ -508,7 +508,7 @@ class OptimizedModel:
         print(f"Data size after dropna: {len(data)}")
         print(f"Final memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
 
-        X = data[factors_long]
+        X = data[[factors_long]]
         y = data["target"].replace([np.inf, -np.inf], 0)
 
         X_scaled = self.scaler.fit_transform(X)  # stadardize features by z-score
