@@ -7,14 +7,17 @@ import torch.multiprocessing as mp
 import xgboost as xgb  # type: ignore
 from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
+import matplotlib.pyplot as plt  # type: ignore
 import shap  # type: ignore
 
-DEVICE = "cpu"
+PROCESSING_DEVICE = "cpu"
+TRAIN_DEVICE = "cuda"
 PROCESSES = mp.cpu_count() // 2  # use half of the available CPU cores
 BASE_DIR = os.getcwd()
 TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
 TRAIN_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
-SUBMISSION_ID_PATH = os.path.join(BASE_DIR, "submission_id.csv")
+SAMPLE_SUBMISSION_PATH = os.path.join(BASE_DIR, "sample_submission.csv")
+SUBMISSION_PATH = os.path.join(BASE_DIR, "submit.csv")
 
 
 def compute_factors_torch(df, device):
@@ -28,15 +31,22 @@ def compute_factors_torch(df, device):
         df["buy_volume"].values, dtype=torch.float32, device=device
     )
 
-    def apply_pool(tensor, window, device):
+    def apply_pool(tensor, window):
         max_pad = window // 2
         input_length = len(tensor)
         padded = torch.nn.functional.avg_pool1d(
-            tensor.unsqueeze(0), kernel_size=window, stride=1, padding=max_pad
+            tensor.unsqueeze(0),
+            kernel_size=window,
+            stride=1,
+            padding=max_pad,
         ).squeeze()
         pad_size = input_length - len(padded)
         if pad_size > 0:
-            padded = torch.nn.functional.pad(padded, (0, pad_size), mode="replicate")
+            padded = torch.nn.functional.pad(
+                padded,
+                (0, pad_size),
+                mode="replicate",
+            )
         elif pad_size < 0:
             padded = padded[:input_length]
         return padded[:input_length]
@@ -129,13 +139,19 @@ def compute_factors_torch(df, device):
 
     # Bollinger Bands - https://www.investopedia.com/terms/b/bollingerbands.asp
     ## Volatility bands around a moving average
-    rolling_mean = apply_pool(close, 20, device)
+    rolling_mean = apply_pool(close, 20)
     # Calculate squared differences and apply the same pooling
     squared_diff = (close - rolling_mean) ** 2
-    rolling_var = apply_pool(squared_diff, 20, device)
+    rolling_var = apply_pool(squared_diff, 20)
     rolling_std = torch.sqrt(rolling_var)
     bb_upper = rolling_mean + 2 * rolling_std
     bb_lower = rolling_mean - 2 * rolling_std
+    bb_mid = (bb_upper + bb_lower) / 2
+
+    bb_width = bb_upper - bb_lower
+    bb_dev = (close - bb_mid) / bb_width
+    squeeze_ratio = bb_width / (keltner_upper - keltner_lower)
+
     # Remove the manual padding since apply_pool already handles it
     # bb_upper = torch.nn.functional.pad(bb_upper, (19, 0), mode='constant', value=0)
     # bb_lower = torch.nn.functional.pad(bb_lower, (19, 0), mode='constant', value=0)
@@ -166,17 +182,15 @@ def compute_factors_torch(df, device):
         torch.isfinite(stochastic_k), stochastic_k, torch.tensor(50.0, device=device)
     )
     stochastic_k = torch.clamp(stochastic_k, 0, 100)
-    stochastic_d = apply_pool(stochastic_k, 3, device)
+    stochastic_d = apply_pool(stochastic_k, 3)
     stochastic_d = torch.clamp(stochastic_d, 0, 100)
 
     # CCI - Commodity Channel Index: https://www.investopedia.com/terms/c/cci.asp
     ## Measures deviation of price from its average price over a period
     ## CCI = (Typical Price - SMA(Typical Price)) / (0.015 * Mean Deviation)
     typical_price = (high + low + close) / 3
-    sma_typical_price = apply_pool(typical_price, 20, device)
-    mean_deviation = apply_pool(
-        torch.abs(typical_price - sma_typical_price), 20, device
-    )
+    sma_typical_price = apply_pool(typical_price, 20)
+    mean_deviation = apply_pool(torch.abs(typical_price - sma_typical_price), 20)
     cci = (typical_price - sma_typical_price) / (0.015 * mean_deviation + 1e-8)
     cci = torch.where(torch.isfinite(cci), cci, torch.tensor(0.0, device=device))
     cci = torch.clamp(cci, -100, 100)
@@ -192,10 +206,10 @@ def compute_factors_torch(df, device):
         close[1:] < close[:-1], money_flow[1:], torch.tensor(0.0, device=device)
     )
     sum_positive_flow = apply_pool(
-        torch.cat([torch.tensor([0.0], device=device), positive_money_flow]), 20, device
+        torch.cat([torch.tensor([0.0], device=device), positive_money_flow]), 20
     )
     sum_negative_flow = apply_pool(
-        torch.cat([torch.tensor([0.0], device=device), negative_money_flow]), 20, device
+        torch.cat([torch.tensor([0.0], device=device), negative_money_flow]), 20
     )
     mfi = (sum_positive_flow - sum_negative_flow) / (
         sum_positive_flow + sum_negative_flow + 1e-8
@@ -242,8 +256,12 @@ def compute_factors_torch(df, device):
     df["cci"] = cci.cpu().numpy()
     df["mfi"] = mfi.cpu().numpy()
     df["obv"] = obv.cpu().numpy()
+
     df["bb_upper"] = bb_upper.cpu().numpy()
     df["bb_lower"] = bb_lower.cpu().numpy()
+    df["bb_width"] = bb_width.cpu().numpy()
+    df["bb_dev"] = bb_dev.cpu().numpy()
+    df["squeeze_ratio"] = squeeze_ratio.cpu().numpy()
 
     return df
 
@@ -306,9 +324,20 @@ def get_single_symbol_kline_data(symbol, train_data_path, device):
         )
 
 
+def get_all_symbols(train_data_path):
+    try:
+        parquet_name_list = os.listdir(train_data_path)
+        symbol_list = [parquet_name.split(".")[0] for parquet_name in parquet_name_list]
+        return symbol_list
+    except Exception as e:
+        print(f"Error in get_all_symbols: {e}")
+        return []
+
+
 class OptimizedModel:
 
     RAW_INDICATORS = [
+        "close_price",
         "vwap",
         "amount",
         "atr",
@@ -319,6 +348,9 @@ class OptimizedModel:
         "rsi",
         "bb_upper",
         "bb_lower",
+        "bb_width",
+        "bb_dev",
+        "squeeze_ratio",
         "keltner_upper",
         "keltner_lower",
         "stochastic_d",
@@ -331,22 +363,25 @@ class OptimizedModel:
         "1h_momentum",
         "4h_momentum",
         "7d_momentum",
+        # "log_return_1h",
+        # "log_return_4h",
+        # "log_return_7d",
         "amount_sum",
         "vol_momentum",
-        "buy_pressure",
+        "buy_pressure_ratio",
         "24hour_rtn",
-        "bollinger_width",
     ]
 
     def __init__(self):
         self.train_data_path = TRAIN_DATA_DIR
-        self.submission_id_path = SUBMISSION_ID_PATH
+        self.sample_submission_path = SAMPLE_SUBMISSION_PATH
+        self.submission_path = SUBMISSION_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
         self.scaler = StandardScaler()
-        # self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = DEVICE
+        self.processing_device = PROCESSING_DEVICE
+        self.training_device = TRAIN_DEVICE
         self.cache_dir = TRAIN_CACHE_DIR
-        print(f"Using device: {self.device}")
+        print(f"Using device: {self.processing_device}")
 
     def get_all_symbol_list(self):
         try:
@@ -360,7 +395,7 @@ class OptimizedModel:
             return []
 
     def get_all_symbol_kline(self):
-        t0 = datetime.datetime.now()
+        t0 = time.monotonic()
 
         try:
             pool = mp.Pool(processes=PROCESSES)  # use multi core
@@ -374,7 +409,7 @@ class OptimizedModel:
             promise_list = [
                 pool.apply_async(
                     get_single_symbol_kline_data,
-                    (symbol, self.train_data_path, self.device),
+                    (symbol, self.train_data_path, self.processing_device),
                 )
                 for symbol in all_symbol_list
             ]
@@ -444,9 +479,7 @@ class OptimizedModel:
 
         raw_ind_arrays = {ind: align_df(ind) for ind in self.RAW_INDICATORS}
 
-        print(
-            f"Finished get all symbols kline, time elapsed: {datetime.datetime.now() - t0}"
-        )
+        print(f"Finished get all symbols kline, time elapsed: {time.monotonic() - t0}")
         return (all_symbol_list, time_arr, raw_ind_arrays)
 
     def weighted_spearmanr(self, y_true, y_pred):
@@ -466,112 +499,165 @@ class OptimizedModel:
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
 
     def train(self, df_target, factor_dfs):
-        print("Begin Training model...")
-        factors_long = []
-        for ind, df in factor_dfs.items():
-            factor = df.stack().astype(
-                "float32"
-            )  # Convert to float32 for memory efficiency
-            factor.name = ind
-            factors_long.append(factor)
+        print("Preparing data for training...")
+        t0 = time.monotonic()
 
-        target_long = df_target.stack().astype(
-            "float32"
-        )  # Convert to float32 for memory efficiency
+        target_long = df_target.astype(np.float32).stack()
         target_long.name = "target"
+
+        common_index = target_long.index
+
+        factor_long = []
+        for ind, df in factor_dfs.items():
+            factor = (
+                df.astype(np.float32)
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+                .stack()
+                .reindex(common_index, fill_value=0)
+            )
+
+            factor.name = ind
+            factor_long.append(factor)
 
         data = pd.concat(
             [
-                *factors_long,
+                *factor_long,
                 target_long,
             ],
             axis=1,
         )
 
-        print(f"Data size before dropna: {len(data)}")
-        # data = data.replace([np.inf, -np.inf], np.nan)
-        # data.dropna(inplace=True)
-        # print(f"Data size after dropna: {len(data)}")
-
-        # Process in chunks to avoid memory issues
-        chunk_size = 1000000  # 1 million rows per chunk
-        processed_chunks = []
-
-        for i in range(0, len(data), chunk_size):
-            chunk = data.iloc[i : i + chunk_size].copy()
-            chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
-            chunk.dropna(inplace=True)
-            processed_chunks.append(chunk)
-            print(
-                f"Processed chunk {i//chunk_size + 1}/{(len(data)-1)//chunk_size + 1}"
-            )
-
-        data = pd.concat(processed_chunks, ignore_index=True)
-        print(f"Data size after dropna: {len(data)}")
+        elapsed_time = time.monotonic() - t0
         print(
-            f"Final memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
+            f"Data processing completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
         )
+
+        print(
+            f"Data memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
+        )
+        # print(data.index.memory_usage(deep=True) / 1024**3)
 
         factor_names = list(factor_dfs.keys())
         X = data[factor_names]
-        y = data["target"].replace([np.inf, -np.inf], 0)
+        y = data["target"].replace([np.inf, -np.inf], 0).fillna(0)
 
-        X_scaled = self.scaler.fit_transform(X)  # stadardize features by z-score
+        # X_scaled = np.clip(X_scaled, -3, 3) # clip outliers to remove noise?
 
-        tscv = TimeSeriesSplit(n_splits=10)
-        best_score = -np.inf
-        best_model = None
+        print("Calculating weights")
+        sample_weight = np.where(
+            (y > y.quantile(0.95)) | (y < y.quantile(0.05)),
+            3,
+            1,
+        )  # Higher weight to extrema to better capture trends
 
-        for train_idx, val_idx in tscv.split(X_scaled):
-            X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
+        print("Begin training model...")
+        t0 = time.monotonic()
+
+        tscv = TimeSeriesSplit(n_splits=8)
+
+        fold_models = []
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
+            print(f"Training fold {fold}...")
+
+            X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            y_train_clean = y_train.fillna(0)
-            sample_weight = np.where(
-                (y_train_clean > y_train_clean.quantile(0.9))
-                | (y_train_clean < y_train_clean.quantile(0.1)),
-                2,
-                1,
+            w_train = sample_weight[train_idx]
+
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
+            X_val_scaled = scaler.transform(X_val).astype(np.float32)
+
+            d_train = xgb.DMatrix(X_train_scaled, y_train, weight=w_train)
+            d_val = xgb.DMatrix(X_val_scaled, y_val)
+
+            XGB_PARAMS = {
+                "objective": "reg:squarederror",
+                "learning_rate": 0.01,
+                "max_depth": 10,
+                "subsample": 0.8,
+                "reg_lambda": 2.0,
+                "reg_alpha": 1.0,
+                "colsample_bytree": 0.8,
+                "tree_method": "hist",
+                "device": self.training_device,
+                "random_state": 42,
+                "eval_metric": "rmse",
+            }
+
+            booster = xgb.train(
+                params=XGB_PARAMS,
+                dtrain=d_train,
+                evals=[(d_train, "train"), (d_val, "val")],
+                num_boost_round=2000,
+                early_stopping_rounds=50,
+                verbose_eval=True,
             )
 
-            model = xgb.XGBRegressor(
-                objective="reg:squarederror",
-                learning_rate=0.01,
-                max_depth=20,
-                subsample=0.8,
-                n_estimators=500,
-                reg_lambda=1,
-                tree_method="hist",
-                device=self.device,
-                early_stopping_rounds=20,
-                random_state=42,
-            )
-            model.fit(
-                X_train,
-                y_train,
-                sample_weight=sample_weight,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-            )
+            fold_models.append(booster)
 
-            y_pred_val = model.predict(X_val)
-            score = self.weighted_spearmanr(y_val, y_pred_val)
-            if score > best_score:
-                print(f"New best score: {score:.4f}")
-                best_score = score
-                best_model = model
+        elapsed_time = time.monotonic() - t0
+        print(
+            f"Training completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
+        )
 
-        print(f"Best validation Spearman score: {best_score:.4f}")
+        print("Evaluating Model...")
+        # Calculate
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X).astype(np.float32)
 
-        data["y_pred"] = best_model.predict(X_scaled)
-        data["y_pred"].replace([np.inf, -np.inf], 0, inplace=True)
-        data["y_pred"].fillna(0, inplace=True)
+        BATCH_SIZE = 1_000_000
+        n, m = X.shape
+
+        y_pred_sum = np.zeros(n, dtype=np.float32)
+        shap_values_sum = np.zeros((n, m + 1), dtype=np.float32)
+
+        # Evaluated using in-sample prediction with batching to save memory (8gb vram, fuck)
+        for i, start in enumerate(range(0, n, BATCH_SIZE)):
+            end = min(start + BATCH_SIZE, n)
+            batch = X_scaled[start:end].astype(np.float32, copy=False)
+            dmatrix = xgb.DMatrix(
+                batch
+            )  # create one DMatrix for all boosters to save memory
+
+            for booster in fold_models:
+                shap_preds = booster.predict(
+                    dmatrix,
+                    pred_contribs=True,
+                    iteration_range=(
+                        (
+                            0,
+                            booster.best_iteration + 1,
+                        )
+                        if booster.best_iteration
+                        else None
+                    ),
+                    validate_features=False,
+                )
+
+                y_pred_sum[start:end] += shap_preds.sum(axis=1)
+                shap_values_sum[start:end, :] += shap_preds
+
+            print(f"Evaluated batch {i//BATCH_SIZE + 1}/{(n-1)//BATCH_SIZE + 1}")
+
+        shap_values_mean = shap_values_sum / len(fold_models)
+        feature_shap_mean = shap_values_mean[:, :m]  # drop bias
+
+        # Take average of predictions of all boosters
+        data["y_pred"] = y_pred_sum / len(fold_models)
+        data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
         data["y_pred"] = data["y_pred"].ewm(span=5).mean()
+
+        rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
+        print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
         df_submit = data.reset_index(level=0)
         df_submit = df_submit[["level_0", "y_pred"]]
         df_submit["symbol"] = df_submit.index.values
         df_submit = df_submit[["level_0", "symbol", "y_pred"]]
         df_submit.columns = ["datetime", "symbol", "predict_return"]
+
+        df_submit["datetime"] = pd.to_datetime(df_submit["datetime"], unit="s")
         df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
         df_submit["id"] = (
             df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -580,8 +666,8 @@ class OptimizedModel:
         )
         df_submit = df_submit[["id", "predict_return"]]
 
-        if os.path.exists(self.submission_id_path):
-            df_submission_id = pd.read_csv(self.submission_id_path)
+        if os.path.exists(self.sample_submission_path):
+            df_submission_id = pd.read_csv(self.sample_submission_path)
             # print("Submission ID sample:", df_submission_id.head())
             id_list = df_submission_id["id"].tolist()
             print(f"Submission ID count: {len(id_list)}")
@@ -596,12 +682,12 @@ class OptimizedModel:
             )
         else:
             print(
-                f"Warning: {self.submission_id_path} not found. Saving submission without ID filtering."
+                f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
             )
             df_submit_competion = df_submit
 
         print("Submission file sample:", df_submit_competion.head())
-        df_submit_competion.to_csv("submit.csv", index=False)
+        df_submit_competion.to_csv(self.submission_path, index=False)
 
         df_check = data.reset_index(level=0)
         df_check = df_check[["level_0", "target"]]
@@ -617,13 +703,9 @@ class OptimizedModel:
         df_check = df_check[["id", "true_return"]]
         df_check.to_csv("check.csv", index=False)
 
-        rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
-        print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
-
-        # SHAP plot
-        explainer = shap.Explainer(best_model)
-        shap_values = explainer(X_scaled)
-        shap.summary_plot(shap_values, X.columns)
+        # Plot using the mean SHAP values
+        shap.summary_plot(feature_shap_mean, features=X, features_names=list(X.columns))
+        plt.show()
 
     def run(self):
         print("Train data directory contents:", os.listdir(self.train_data_path))
@@ -641,6 +723,8 @@ class OptimizedModel:
             key: os.path.join(self.cache_dir, f"df_{key}.parquet")
             for key in self.DERIVED_INDICATORS
         }
+
+        all_symbol_list = None
 
         raw_indicator_cache_exists = all(
             os.path.isfile(path) for path in RAW_CACHE_FILES.values()
@@ -694,8 +778,8 @@ class OptimizedModel:
                 raw_dfs[ind].to_parquet(file)
                 print(f"Saved {ind} to cache, shape: {raw_dfs[ind].shape}")
 
-        windows_1d = 4 * 24 * 1
         windows_7d = 4 * 24 * 7
+        windows_1d = 4 * 24 * 1
         windows_4h = 4 * 4
         windows_1h = 4
 
@@ -740,6 +824,31 @@ class OptimizedModel:
             derived_dfs["7d_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["7d_momentum"].fillna(0, inplace=True)
 
+            # # lOG returns
+            # derived_dfs["log_return_1h"] = np.log(
+            #     raw_dfs["close_price"] / raw_dfs["close_price"].shift(windows_1h)
+            # )
+            # derived_dfs["log_return_1h"].replace(
+            #     [np.inf, -np.inf], np.nan, inplace=True
+            # )
+            # derived_dfs["log_return_1h"].fillna(0, inplace=True)
+
+            # derived_dfs["log_return_4h"] = np.log(
+            #     raw_dfs["close_price"] / raw_dfs["close_price"].shift(windows_4h)
+            # )
+            # derived_dfs["log_return_4h"].replace(
+            #     [np.inf, -np.inf], np.nan, inplace=True
+            # )
+            # derived_dfs["log_return_4h"].fillna(0, inplace=True)
+
+            # derived_dfs["log_return_7d"] = np.log(
+            #     raw_dfs["close_price"] / raw_dfs["close_price"].shift(windows_7d)
+            # )
+            # derived_dfs["log_return_7d"].replace(
+            #     [np.inf, -np.inf], np.nan, inplace=True
+            # )
+            # derived_dfs["log_return_7d"].fillna(0, inplace=True)
+
             # volume factor
             derived_dfs["amount_sum"] = raw_dfs["amount"].rolling(windows_7d).sum()
             derived_dfs["amount_sum"].replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -752,14 +861,17 @@ class OptimizedModel:
             derived_dfs["vol_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["vol_momentum"].fillna(0, inplace=True)
 
-            derived_dfs["bollinger_width"] = raw_dfs["bb_upper"] - raw_dfs["bb_lower"]
+            # # bollinger width
+            # derived_dfs["bollinger_width"] = raw_dfs["bb_upper"] - raw_dfs["bb_lower"]
 
             # buy pressure
-            derived_dfs["buy_pressure"] = raw_dfs["buy_volume"] - (
-                raw_dfs["volume"] - raw_dfs["buy_volume"]
+            derived_dfs["buy_pressure_ratio"] = (
+                raw_dfs["buy_volume"] - (raw_dfs["volume"] - raw_dfs["buy_volume"])
+            ) / raw_dfs["volume"]
+            derived_dfs["buy_pressure_ratio"].replace(
+                [np.inf, -np.inf], np.nan, inplace=True
             )
-            derived_dfs["buy_pressure"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["buy_pressure"].fillna(0, inplace=True)
+            derived_dfs["buy_pressure_ratio"].fillna(0, inplace=True)
 
             # 24 hour return
             derived_dfs["24hour_rtn"] = (
@@ -768,26 +880,34 @@ class OptimizedModel:
             derived_dfs["24hour_rtn"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["24hour_rtn"].fillna(0, inplace=True)
 
+            # squeeze ratio
+
             for ind, df in derived_dfs.items():
                 file = DERIVED_CACHE_FILES[ind]
                 print(f"Saving {ind} to cache, shape: {df.shape}")
                 df.to_parquet(file)
                 print(f"Saved {ind} to cache at {file}")
 
-        # TODO: add more factors
-
-        # Compare against btc, btc usually has the highest volume and liquidity // might need to import new data
-
-        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
+        if all_symbol_list is None:
+            all_symbol_list = self.get_all_symbol_list()
+            if not all_symbol_list:
+                print("No symbols found, exiting.")
+                return
 
         raw_factors = [
+            "vwap",
             "vwap_deviation",
             "atr",
             "macd",
             "rsi",
-            "keltner_upper",
-            "keltner_lower",
-            "stochastic_d",
+            "bb_upper",
+            "bb_lower",
+            "bb_width",
+            "bb_dev",
+            "squeeze_ratio",
+            # "keltner_upper",
+            # "keltner_lower",
+            # "stochastic_d",
             "cci",
             "mfi",
             "obv",
@@ -797,16 +917,55 @@ class OptimizedModel:
             "1h_momentum",
             "4h_momentum",
             "7d_momentum",
-            "bollinger_width",
+            # "log_return_1h",
+            # "log_return_4h",
+            # "log_return_7d",
             "amount_sum",
             "vol_momentum",
-            "buy_pressure",
+            "buy_pressure_ratio",
         ]
 
         factor_dfs = {
             **{key: raw_dfs[key] for key in raw_factors},
             **{key: derived_dfs[key] for key in derived_factors},
         }
+
+        # market_syms = ["BTCUSDT", "ETHUSDT"]
+        # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
+
+        # external_dfs = {}
+        # for factor in market_inds:
+        #     if factor not in factor_dfs:
+        #         print(f"Missing raw factor {factor}, cannot proceed.")
+        #         return
+
+        #     for market_symbol in market_syms:
+        #         combined_col = None
+
+        #         if market_symbol not in factor_dfs[factor].columns:
+        #             print(
+        #                 f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
+        #             )
+        #             return
+        #         if combined_col is None:
+        #             combined_col = factor_dfs[factor][market_symbol].copy()
+        #         else:
+        #             combined_col += factor_dfs[factor][market_symbol]
+
+        #     external_dfs[f"btc_eth_{factor}"] = pd.DataFrame(
+        #         {
+        #             symbol: combined_col if symbol not in market_syms else np.nan
+        #             for symbol in all_symbol_list
+        #         },
+        #         index=factor_dfs[factor].index,
+        #     )
+
+        # factor_dfs.update(external_dfs)
+
+        print("Finished loading factors")
+        print(f"Indicators: {list(factor_dfs.keys())}")
+
+        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
 
         self.train(df_target, factor_dfs)
 
