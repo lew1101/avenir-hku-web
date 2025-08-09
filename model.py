@@ -561,10 +561,11 @@ class OptimizedModel:
             "learning_rate": 0.02,
             "max_depth": 10,
             "subsample": 0.8,
-            # "reg_lambda": 2.0,
-            # "reg_alpha": 1.0,
+            "grow_policy": "lossguide",
             "min_child_weight": 2,
             "gamma": 0.2,
+            "reg_lambda": 2.0,
+            "reg_alpha": 1.0,
             "colsample_bytree": 0.8,
             "tree_method": "hist",
             "device": self.training_device,
@@ -573,8 +574,9 @@ class OptimizedModel:
         }
 
         tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=None)
+        best_score = -np.inf
+        best_model = None
 
-        fold_best_rounds = []
         for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
             print(f"Training fold {fold}...")
 
@@ -587,7 +589,7 @@ class OptimizedModel:
             )
             d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
 
-            bst = xgb.train(
+            model = xgb.train(
                 params=XGB_PARAMS,
                 dtrain=d_train,
                 evals=[(d_train, "train"), (d_val, "val")],
@@ -596,40 +598,15 @@ class OptimizedModel:
                 verbose_eval=20,
             )
 
-            best_round = (bst.best_iteration or 0) + 1
-            fold_best_rounds.append(best_round)
-            print(f"Fold {fold}: best_round = {best_round}")
-
-        final_rounds = int(np.median(fold_best_rounds))
-        print(
-            f"\nChosen num_boost_round = {final_rounds} (median of {fold_best_rounds})"
-        )
-
-        # train_end = "2023-12-31"
-        # test_start = "2024-01-01"
-
-        # X_tr = X.loc[:train_end]
-        # y_tr = y.loc[:train_end]
-        # X_te = X.loc[test_start:]
-        # y_te = y.loc[test_start:]
-
-        dfull = xgb.QuantileDMatrix(X, y, weight=make_weights(y), max_bin=MAX_BINS)
-        seeds = [42, 77, 123]  # set to [42] if you want just one model
-        final_models = []
-        for sd in seeds:
-            params = dict(XGB_PARAMS)
-            params["random_state"] = sd
-            m = xgb.train(
-                params=params,
-                dtrain=dfull,
-                num_boost_round=final_rounds,
-                verbose_eval=20,
+            y_pred_val = model.predict(
+                d_val,
+                iteration_range=(0, model.best_iteration + 1),
             )
-
-            final_models.append(m)
-
-        model_n = len(final_models)
-        print(f"Trained {model_n} final model(s).")
+            score = self.weighted_spearmanr(y_val, y_pred_val)
+            print(f"Fold {fold} - Weighted Spearman correlation {score:.4f}")
+            if score > best_score:
+                best_score = score
+                best_model = model
 
         elapsed_time = time.monotonic() - t0
         print(
@@ -638,99 +615,122 @@ class OptimizedModel:
 
         print("Evaluating Model...")
         BATCH_SIZE = 100_000
-        n, m = X.shape
 
-        y_pred_mean = np.zeros(n, dtype=np.float32)
-        shap_values_mean = np.zeros((n, m + 1), dtype=np.float32)
+        n, m = X.shape
+        total_batches = (n - 1) // BATCH_SIZE
+
+        SHAP_BATCH_IDX = total_batches // 2
+
+        y_pred = np.zeros(n, dtype=np.float32)
+        shap_values = None
+        shap_slice = None  # will hold slice(start, end) for the SHAP batch
 
         # Evaluated using in-sample prediction with batching to save memory (8gb vram, fuck)
         for i, start in enumerate(range(0, n, BATCH_SIZE)):
             end = min(start + BATCH_SIZE, n)
-            batch = X.astype(np.float32, copy=False)
+            batch = X[start:end].astype(np.float32, copy=False)
 
             # create one DMatrix for all boosters to save memory
             dmatrix = xgb.DMatrix(batch)
 
-            for booster in final_models:
-                shap_preds = booster.predict(
+            if i == SHAP_BATCH_IDX:
+                shap_values = best_model.predict(
                     dmatrix,
                     pred_contribs=True,
-                    iteration_range=(0, final_rounds),
-                    validate_features=False,
+                    iteration_range=(0, best_model.best_iteration + 1),
                 )
 
-                y_pred_mean[start:end] += shap_preds.sum(axis=1)
-                shap_values_mean[start:end, :] += shap_preds
+                shap_slice = slice(start, end)
+                y_pred[start:end] = shap_values.sum(axis=1, dtype=np.float32)
 
-            y_pred_mean[start:end] /= model_n  # average predictions across all boosters
-            shap_values_mean[start:end, :] /= model_n  # type: ignore
+                print(f"Evaluated SHAP using batch {i}/{total_batches}")
 
-            print(f"Evaluated batch {i//BATCH_SIZE + 1}/{(n-1)//BATCH_SIZE + 1}")
+            else:
+                y_pred[start:end] = best_model.predict(
+                    dmatrix,
+                    pred_contribs=False,
+                    iteration_range=(0, best_model.best_iteration + 1),
+                ).astype(np.float32)
 
-        feature_shap_mean = shap_values_mean[:, :m]  # drop bias
+                print(f"Evaluated batch {i}/{total_batches}")
+
+        feature_shap = shap_values[:, :m]  # drop bias
+        X_for_shap = X.iloc[shap_slice]
 
         # Take average of predictions of all boosters
-        data["y_pred"] = y_pred_mean
+        data["y_pred"] = y_pred
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
         data["y_pred"] = data["y_pred"].ewm(span=5).mean()
 
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
-        df_submit = data.reset_index(level=0)
-        df_submit = df_submit[["level_0", "y_pred"]]
-        df_submit["symbol"] = df_submit.index.values
-        df_submit = df_submit[["level_0", "symbol", "y_pred"]]
-        df_submit.columns = ["datetime", "symbol", "predict_return"]
+        OUTPUT_CSV = False
 
-        df_submit["datetime"] = pd.to_datetime(df_submit["datetime"], unit="s")
-        df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
-        df_submit["id"] = (
-            df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            + "_"
-            + df_submit["symbol"]
-        )
-        df_submit = df_submit[["id", "predict_return"]]
+        if OUTPUT_CSV:
+            print("Saving predictions to CSV...")
 
-        if os.path.exists(self.sample_submission_path):
-            df_submission_id = pd.read_csv(self.sample_submission_path)
-            # print("Submission ID sample:", df_submission_id.head())
-            id_list = df_submission_id["id"].tolist()
-            print(f"Submission ID count: {len(id_list)}")
-            df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
-            missing_elements = list(set(id_list) - set(df_submit_competion["id"]))
-            print(f"Missing IDs: {len(missing_elements)}")
-            new_rows = pd.DataFrame(
-                {"id": missing_elements, "predict_return": [0] * len(missing_elements)}
+            df_submit = data.reset_index(level=0)
+            df_submit = df_submit[["level_0", "y_pred"]]
+            df_submit["symbol"] = df_submit.index.values
+            df_submit = df_submit[["level_0", "symbol", "y_pred"]]
+            df_submit.columns = ["datetime", "symbol", "predict_return"]
+
+            df_submit["datetime"] = pd.to_datetime(df_submit["datetime"], unit="s")
+            df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
+            df_submit["id"] = (
+                df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                + "_"
+                + df_submit["symbol"]
             )
-            df_submit_competion = pd.concat(
-                [df_submit_competion, new_rows], ignore_index=True
-            )
-        else:
-            print(
-                f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
-            )
-            df_submit_competion = df_submit
+            df_submit = df_submit[["id", "predict_return"]]
 
-        print("Submission file sample:", df_submit_competion.head())
-        df_submit_competion.to_csv(self.submission_path, index=False)
+            if os.path.exists(self.sample_submission_path):
+                df_submission_id = pd.read_csv(self.sample_submission_path)
+                # print("Submission ID sample:", df_submission_id.head())
+                id_list = df_submission_id["id"].tolist()
+                print(f"Submission ID count: {len(id_list)}")
+                df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
+                missing_elements = list(set(id_list) - set(df_submit_competion["id"]))
+                print(f"Missing IDs: {len(missing_elements)}")
+                new_rows = pd.DataFrame(
+                    {
+                        "id": missing_elements,
+                        "predict_return": [0] * len(missing_elements),
+                    }
+                )
+                df_submit_competion = pd.concat(
+                    [df_submit_competion, new_rows], ignore_index=True
+                )
+            else:
+                print(
+                    f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
+                )
+                df_submit_competion = df_submit
 
-        df_check = data.reset_index(level=0)
-        df_check = df_check[["level_0", "target"]]
-        df_check["symbol"] = df_check.index.values
-        df_check = df_check[["level_0", "symbol", "target"]]
-        df_check.columns = ["datetime", "symbol", "true_return"]
-        df_check = df_check[df_check["datetime"] >= self.start_datetime]
-        df_check["id"] = (
-            df_check["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            + "_"
-            + df_check["symbol"]
-        )
-        df_check = df_check[["id", "true_return"]]
-        df_check.to_csv("check.csv", index=False)
+            print("Submission file sample:", df_submit_competion.head())
+            df_submit_competion.to_csv(self.submission_path, index=False)
+
+            df_check = data.reset_index(level=0)
+            df_check = df_check[["level_0", "target"]]
+            df_check["symbol"] = df_check.index.values
+            df_check = df_check[["level_0", "symbol", "target"]]
+            df_check.columns = ["datetime", "symbol", "true_return"]
+            df_check = df_check[df_check["datetime"] >= self.start_datetime]
+            df_check["id"] = (
+                df_check["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                + "_"
+                + df_check["symbol"]
+            )
+            df_check = df_check[["id", "true_return"]]
+            df_check.to_csv("check.csv", index=False)
+
+            print("Finished saving to csv.")
 
         # Plot using the mean SHAP values
-        shap.summary_plot(feature_shap_mean, features=X, features_names=list(X.columns))
+        shap.summary_plot(
+            feature_shap, features=X_for_shap, feature_names=list(X.columns)
+        )
         plt.show()
 
     def run(self):
