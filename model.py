@@ -542,59 +542,94 @@ class OptimizedModel:
         X = data[factor_names]
         y = data["target"].replace([np.inf, -np.inf], 0).fillna(0)
 
-        # X_scaled = np.clip(X_scaled, -3, 3) # clip outliers to remove noise?
-
-        print("Calculating weights")
-        sample_weight = np.where(
-            (y > y.quantile(0.95)) | (y < y.quantile(0.05)),
-            3,
-            1,
-        )  # Higher weight to extrema to better capture trends
+        def make_weights(y_series):
+            return np.where(
+                (y_series > y_series.quantile(0.95))
+                | (y_series < y_series.quantile(0.05)),
+                2.0,
+                1.0,
+            ).astype(np.float32)
 
         print("Begin training model...")
         t0 = time.monotonic()
 
-        tscv = TimeSeriesSplit(n_splits=8)
+        MAX_BINS = 256
+        GAP = 32
 
-        fold_models = []
+        XGB_PARAMS = {
+            "objective": "reg:squarederror",
+            "learning_rate": 0.02,
+            "max_depth": 10,
+            "subsample": 0.8,
+            # "reg_lambda": 2.0,
+            # "reg_alpha": 1.0,
+            "min_child_weight": 2,
+            "gamma": 0.2,
+            "colsample_bytree": 0.8,
+            "tree_method": "hist",
+            "device": self.training_device,
+            "random_state": 42,
+            "eval_metric": "rmse",
+        }
+
+        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=None)
+
+        fold_best_rounds = []
         for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
             print(f"Training fold {fold}...")
 
-            X_train, X_val = X[train_idx], X[val_idx]
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            w_train = sample_weight[train_idx]
+            w_train = make_weights(y_train)
 
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
-            X_val_scaled = scaler.transform(X_val).astype(np.float32)
+            d_train = xgb.QuantileDMatrix(
+                X_train, y_train, weight=w_train, max_bin=MAX_BINS
+            )
+            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
 
-            d_train = xgb.DMatrix(X_train_scaled, y_train, weight=w_train)
-            d_val = xgb.DMatrix(X_val_scaled, y_val)
-
-            XGB_PARAMS = {
-                "objective": "reg:squarederror",
-                "learning_rate": 0.01,
-                "max_depth": 10,
-                "subsample": 0.8,
-                "reg_lambda": 2.0,
-                "reg_alpha": 1.0,
-                "colsample_bytree": 0.8,
-                "tree_method": "hist",
-                "device": self.training_device,
-                "random_state": 42,
-                "eval_metric": "rmse",
-            }
-
-            booster = xgb.train(
+            bst = xgb.train(
                 params=XGB_PARAMS,
                 dtrain=d_train,
                 evals=[(d_train, "train"), (d_val, "val")],
-                num_boost_round=2000,
-                early_stopping_rounds=50,
-                verbose_eval=True,
+                num_boost_round=3000,
+                early_stopping_rounds=100,
+                verbose_eval=20,
             )
 
-            fold_models.append(booster)
+            best_round = (bst.best_iteration or 0) + 1
+            fold_best_rounds.append(best_round)
+            print(f"Fold {fold}: best_round = {best_round}")
+
+        final_rounds = int(np.median(fold_best_rounds))
+        print(
+            f"\nChosen num_boost_round = {final_rounds} (median of {fold_best_rounds})"
+        )
+
+        # train_end = "2023-12-31"
+        # test_start = "2024-01-01"
+
+        # X_tr = X.loc[:train_end]
+        # y_tr = y.loc[:train_end]
+        # X_te = X.loc[test_start:]
+        # y_te = y.loc[test_start:]
+
+        dfull = xgb.QuantileDMatrix(X, y, weight=make_weights(y), max_bin=MAX_BINS)
+        seeds = [42, 77, 123]  # set to [42] if you want just one model
+        final_models = []
+        for sd in seeds:
+            params = dict(XGB_PARAMS)
+            params["random_state"] = sd
+            m = xgb.train(
+                params=params,
+                dtrain=dfull,
+                num_boost_round=final_rounds,
+                verbose_eval=20,
+            )
+
+            final_models.append(m)
+
+        model_n = len(final_models)
+        print(f"Trained {model_n} final model(s).")
 
         elapsed_time = time.monotonic() - t0
         print(
@@ -602,49 +637,40 @@ class OptimizedModel:
         )
 
         print("Evaluating Model...")
-        # Calculate
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X).astype(np.float32)
-
-        BATCH_SIZE = 1_000_000
+        BATCH_SIZE = 100_000
         n, m = X.shape
 
-        y_pred_sum = np.zeros(n, dtype=np.float32)
-        shap_values_sum = np.zeros((n, m + 1), dtype=np.float32)
+        y_pred_mean = np.zeros(n, dtype=np.float32)
+        shap_values_mean = np.zeros((n, m + 1), dtype=np.float32)
 
         # Evaluated using in-sample prediction with batching to save memory (8gb vram, fuck)
         for i, start in enumerate(range(0, n, BATCH_SIZE)):
             end = min(start + BATCH_SIZE, n)
-            batch = X_scaled[start:end].astype(np.float32, copy=False)
-            dmatrix = xgb.DMatrix(
-                batch
-            )  # create one DMatrix for all boosters to save memory
+            batch = X.astype(np.float32, copy=False)
 
-            for booster in fold_models:
+            # create one DMatrix for all boosters to save memory
+            dmatrix = xgb.DMatrix(batch)
+
+            for booster in final_models:
                 shap_preds = booster.predict(
                     dmatrix,
                     pred_contribs=True,
-                    iteration_range=(
-                        (
-                            0,
-                            booster.best_iteration + 1,
-                        )
-                        if booster.best_iteration
-                        else None
-                    ),
+                    iteration_range=(0, final_rounds),
                     validate_features=False,
                 )
 
-                y_pred_sum[start:end] += shap_preds.sum(axis=1)
-                shap_values_sum[start:end, :] += shap_preds
+                y_pred_mean[start:end] += shap_preds.sum(axis=1)
+                shap_values_mean[start:end, :] += shap_preds
+
+            y_pred_mean[start:end] /= model_n  # average predictions across all boosters
+            shap_values_mean[start:end, :] /= model_n  # type: ignore
 
             print(f"Evaluated batch {i//BATCH_SIZE + 1}/{(n-1)//BATCH_SIZE + 1}")
 
-        shap_values_mean = shap_values_sum / len(fold_models)
         feature_shap_mean = shap_values_mean[:, :m]  # drop bias
 
         # Take average of predictions of all boosters
-        data["y_pred"] = y_pred_sum / len(fold_models)
+        data["y_pred"] = y_pred_mean
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
         data["y_pred"] = data["y_pred"].ewm(span=5).mean()
 
