@@ -333,6 +333,8 @@ def get_all_symbols(train_data_path):
 
 class OptimizedModel:
     RAW_INDICATORS = [
+        "high_price",
+        "low_price",
         "close_price",
         "vwap",
         "amount",
@@ -359,9 +361,13 @@ class OptimizedModel:
         "4h_momentum",
         "7d_momentum",
         "squeeze_ratio",
+        "ult_osc",
         # "log_return_1h",
         # "log_return_4h",
         # "log_return_7d",
+        "price_z",
+        "pct_change",
+        "volume_z",
         "amount_sum",
         "vol_momentum",
         "squeeze_ratio",
@@ -560,11 +566,11 @@ class OptimizedModel:
         XGB_PARAMS = {
             "objective": "reg:squarederror",
             "learning_rate": 0.02,
-            "max_depth": 12,
+            "max_depth": 10,
             "subsample": 0.8,
             # "grow_policy": "lossguide",
             # "max_leaves": 255,
-            "min_child_weight": 2,
+            "min_child_weight": 4,
             "gamma": 0.2,
             "reg_lambda": 2.0,
             "reg_alpha": 1.0,
@@ -668,7 +674,7 @@ class OptimizedModel:
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
-        OUTPUT_CSV = False
+        OUTPUT_CSV = True
 
         if OUTPUT_CSV:
             print("Saving predictions to CSV...")
@@ -729,7 +735,12 @@ class OptimizedModel:
 
             print("Finished saving to csv.")
 
-        # Plot using the mean SHAP values
+        print("Plotting feature importance and SHAP summary...")
+        xgb.plot_importance(model, importance_type="gain", max_num_features=20)
+        plt.title("XGBoost Feature Importance (Gain)")
+        plt.tight_layout()
+        plt.show(block=False)
+
         shap.summary_plot(
             feature_shap, features=X_for_shap, feature_names=list(X.columns)
         )
@@ -752,8 +763,6 @@ class OptimizedModel:
             for key in self.DERIVED_INDICATORS
         }
 
-        Z_SCORE_WINDOW = 96  # 1 day if 15-min bars
-
         all_symbol_list = None
 
         raw_indicator_cache_exists = all(
@@ -767,6 +776,10 @@ class OptimizedModel:
         use_derived_cache = (
             derived_indicator_cache_exists and raw_indicator_cache_exists
         )
+
+        # ================
+        # Raw indicators
+        # ================
 
         raw_dfs = {}
         if use_raw_cache:
@@ -813,6 +826,8 @@ class OptimizedModel:
         windows_4h = 4 * 4
         windows_1h = 4
 
+        Z_SCORE_WINDOW = windows_1d  # 1 day if 15-min bars
+
         time_index = pd.date_range(
             start=self.start_datetime, end="2024-12-31", freq="15min"
         )
@@ -822,6 +837,10 @@ class OptimizedModel:
             if not all_symbol_list:
                 print("No symbols found, exiting.")
                 return
+
+        # ================
+        # Derived indicators
+        # ================
 
         derived_dfs = {}
         if use_derived_cache:
@@ -843,19 +862,19 @@ class OptimizedModel:
             print(
                 f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
             )
-            # 1h_momentum
-            derived_dfs["1h_momentum"] = (
-                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
-            )
-            derived_dfs["1h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["1h_momentum"].fillna(0, inplace=True)
+            # # 1h_momentum
+            # derived_dfs["1h_momentum"] = (
+            #     raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
+            # )
+            # derived_dfs["1h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            # derived_dfs["1h_momentum"].fillna(0, inplace=True)
 
-            # 4h_momentum
-            derived_dfs["4h_momentum"] = (
-                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h) - 1
-            )
-            derived_dfs["4h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["4h_momentum"].fillna(0, inplace=True)
+            # # 4h_momentum
+            # derived_dfs["4h_momentum"] = (
+            #     raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h) - 1
+            # )
+            # derived_dfs["4h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            # derived_dfs["4h_momentum"].fillna(0, inplace=True)
 
             # 7d_momentum
             derived_dfs["7d_momentum"] = (
@@ -889,6 +908,55 @@ class OptimizedModel:
             # )
             # derived_dfs["log_return_7d"].fillna(0, inplace=True)
 
+            # volume_rolling_mean = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).mean()
+            # volume_rolling_std = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).std()
+
+            # derived_dfs["volume_z"] = (raw_dfs["volume"] - volume_rolling_mean) / (
+            #     volume_rolling_std.replace(0, np.nan)
+            # )
+
+            # price z-score
+            price_rolling_mean = raw_dfs["close_price"].rolling(Z_SCORE_WINDOW).mean()
+            price_rolling_std = raw_dfs["close_price"].rolling(Z_SCORE_WINDOW).std()
+
+            derived_dfs["price_z"] = (
+                raw_dfs["close_price"] - price_rolling_mean
+            ) / price_rolling_std.replace(0, np.nan)
+
+            # ultimate oscillator
+            prev_close = raw_dfs["close_price"].shift(1)
+
+            buy_pressure = raw_dfs["close_price"] - np.minimum(
+                raw_dfs["low_price"], prev_close
+            )
+            true_range = np.maximum(raw_dfs["high_price"], prev_close) - np.minimum(
+                raw_dfs["low_price"], prev_close
+            )
+
+            true_range.replace(0, np.nan, inplace=True)  # prevent div by 0
+
+            short_win = 7
+            med_win = 14
+            long_win = 28
+
+            bp1 = buy_pressure.rolling(short_win, min_periods=short_win).sum()
+            tr1 = true_range.rolling(short_win, min_periods=short_win).sum()
+            bp2 = buy_pressure.rolling(med_win, min_periods=med_win).sum()
+            tr2 = true_range.rolling(med_win, min_periods=med_win).sum()
+            bp3 = buy_pressure.rolling(long_win, min_periods=long_win).sum()
+            tr3 = true_range.rolling(long_win, min_periods=long_win).sum()
+
+            avg1 = bp1 / tr1
+            avg2 = bp2 / tr2
+            avg3 = bp3 / tr3
+
+            derived_dfs["ult_osc"] = 100.0 * (4 * avg1 + 2 * avg2 + 1 * avg3) / 7.0
+
+            # percentage change
+            derived_dfs["pct_change"] = raw_dfs["close_price"].pct_change()
+            derived_dfs["pct_change"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            derived_dfs["pct_change"].fillna(0, inplace=True)
+
             # volume factor
             derived_dfs["amount_sum"] = raw_dfs["amount"].rolling(windows_7d).sum()
             derived_dfs["amount_sum"].replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -900,9 +968,6 @@ class OptimizedModel:
             )
             derived_dfs["vol_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             derived_dfs["vol_momentum"].fillna(0, inplace=True)
-
-            # # bollinger width
-            # derived_dfs["bollinger_width"] = raw_dfs["bb_upper"] - raw_dfs["bb_lower"]
 
             # buy ratio
             derived_dfs["buy_ratio"] = raw_dfs["buy_volume"] / raw_dfs["volume"]
@@ -951,7 +1016,7 @@ class OptimizedModel:
 
         raw_factors = [
             "vwap",
-            "vwap_deviation",
+            # "vwap_deviation",
             "atr",
             "macd",
             "rsi",
@@ -968,12 +1033,16 @@ class OptimizedModel:
         ]
 
         derived_factors = [
-            "1h_momentum",
-            "4h_momentum",
+            # "1h_momentum",
+            # "4h_momentum",
             "7d_momentum",
             # "log_return_1h",
             # "log_return_4h",
             # "log_return_7d",
+            "price_z",
+            "pct_change",
+            "ult_osc",
+            # "volume_z",
             "amount_sum",
             "vol_momentum",
             "squeeze_ratio",
@@ -989,11 +1058,16 @@ class OptimizedModel:
             **{key: derived_dfs[key] for key in derived_factors},
         }
 
+        # ================
+        # External indicators
+        # ================
+
         # Add BTCUSDT and ETHUSDT for macro features
         print("Adding BTCUSDT and ETHUSDT macro features...")
 
         market_syms = ["BTCUSDT", "ETHUSDT"]
-        market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
+        # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
+        market_inds = ["vwap", "rsi", "ult_osc", "7d_momentum"]
 
         for factor in market_inds:
             if factor not in feature_dfs:
@@ -1030,7 +1104,11 @@ class OptimizedModel:
                 "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
             ).reindex(time_index, method="ffill")
 
-            usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
+            usdt_usd_df["depeg"] = (
+                usdt_usd_df["close_price"] - 1.0
+            )  # USDT is a 1:1 peg to USD
+            usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            usdt_usd_df["depeg"].fillna(0, inplace=True)
 
             usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
             usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -1042,12 +1120,12 @@ class OptimizedModel:
                 .astype("float32")
             )
 
-            rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
-            rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
+            depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
+            depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
 
             # Step 3: Z-score (avoid div/0)
-            usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - rolling_mean) / (
-                rolling_std.replace(0, np.nan)
+            usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
+                depeg_rolling_std.replace(0, np.nan)
             )
 
             features = [
