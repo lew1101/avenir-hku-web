@@ -561,7 +561,8 @@ class OptimizedModel:
         t0 = time.monotonic()
 
         MAX_BINS = 64
-        GAP = 32
+        GAP = 4 * 24 * 7  # 1 week gap
+        MAX_TRAIN_SIZE = 4 * 24 * 365  # max training of 1 year data
 
         XGB_PARAMS = {
             "objective": "reg:squarederror",
@@ -582,15 +583,24 @@ class OptimizedModel:
             "eval_metric": "rmse",
         }
 
-        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=None)
+        times = X.index.get_level_values(0).to_numpy()
+        uniq_times = np.unique(times)
+        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=MAX_TRAIN_SIZE)
         best_score = -np.inf
         best_model = None
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
+        for fold, (train_t_idx, val_t_idx) in enumerate(tscv.split(uniq_times), start=1):  # type: ignore
             print(f"Training fold {fold}...")
 
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            train_times = uniq_times[train_t_idx]
+            val_times = uniq_times[val_t_idx]
+
+            # map timestamp folds back to row masks
+            train_mask = np.isin(times, train_times)
+            val_mask = np.isin(times, val_times)
+
+            X_train, X_val = X[train_mask], X[val_mask]
+            y_train, y_val = y[train_mask], y[val_mask]
             w_train = make_weights(y_train)
 
             d_train = xgb.QuantileDMatrix(
