@@ -150,7 +150,6 @@ def compute_factors_torch(df, device):
 
     bb_width = bb_upper - bb_lower
     bb_dev = (close - bb_mid) / bb_width
-    squeeze_ratio = bb_width / (keltner_upper - keltner_lower)
 
     # Remove the manual padding since apply_pool already handles it
     # bb_upper = torch.nn.functional.pad(bb_upper, (19, 0), mode='constant', value=0)
@@ -261,8 +260,6 @@ def compute_factors_torch(df, device):
     df["bb_lower"] = bb_lower.cpu().numpy()
     df["bb_width"] = bb_width.cpu().numpy()
     df["bb_dev"] = bb_dev.cpu().numpy()
-    df["squeeze_ratio"] = squeeze_ratio.cpu().numpy()
-
     return df
 
 
@@ -335,7 +332,6 @@ def get_all_symbols(train_data_path):
 
 
 class OptimizedModel:
-
     RAW_INDICATORS = [
         "close_price",
         "vwap",
@@ -350,7 +346,6 @@ class OptimizedModel:
         "bb_lower",
         "bb_width",
         "bb_dev",
-        "squeeze_ratio",
         "keltner_upper",
         "keltner_lower",
         "stochastic_d",
@@ -363,13 +358,19 @@ class OptimizedModel:
         "1h_momentum",
         "4h_momentum",
         "7d_momentum",
+        "squeeze_ratio",
         # "log_return_1h",
         # "log_return_4h",
         # "log_return_7d",
         "amount_sum",
         "vol_momentum",
+        "squeeze_ratio",
         "buy_ratio",
         "24hour_rtn",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
     ]
 
     def __init__(self):
@@ -458,7 +459,7 @@ class OptimizedModel:
         ).reindex(
             time_index, method="ffill"
         )  # unify time steps
-        time_arr = pd.to_datetime(df_open_price.index).values
+        time_arr = pd.to_datetime(df_open_price.index, unit="ms").values
 
         def align_df(key):
             valid_dfs = [
@@ -553,13 +554,13 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 128
+        MAX_BINS = 64
         GAP = 32
 
         XGB_PARAMS = {
             "objective": "reg:squarederror",
             "learning_rate": 0.02,
-            "max_depth": 10,
+            "max_depth": 12,
             "subsample": 0.8,
             # "grow_policy": "lossguide",
             # "max_leaves": 255,
@@ -678,7 +679,6 @@ class OptimizedModel:
             df_submit = df_submit[["level_0", "symbol", "y_pred"]]
             df_submit.columns = ["datetime", "symbol", "predict_return"]
 
-            df_submit["datetime"] = pd.to_datetime(df_submit["datetime"], unit="s")
             df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
             df_submit["id"] = (
                 df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -752,6 +752,8 @@ class OptimizedModel:
             for key in self.DERIVED_INDICATORS
         }
 
+        Z_SCORE_WINDOW = 96  # 1 day if 15-min bars
+
         all_symbol_list = None
 
         raw_indicator_cache_exists = all(
@@ -810,6 +812,16 @@ class OptimizedModel:
         windows_1d = 4 * 24 * 1
         windows_4h = 4 * 4
         windows_1h = 4
+
+        time_index = pd.date_range(
+            start=self.start_datetime, end="2024-12-31", freq="15min"
+        )
+
+        if all_symbol_list is None:
+            all_symbol_list = self.get_all_symbol_list()
+            if not all_symbol_list:
+                print("No symbols found, exiting.")
+                return
 
         derived_dfs = {}
         if use_derived_cache:
@@ -905,18 +917,37 @@ class OptimizedModel:
             derived_dfs["24hour_rtn"].fillna(0, inplace=True)
 
             # squeeze ratio
+            derived_dfs["squeeze_ratio"] = raw_dfs["bb_width"] / (
+                raw_dfs["keltner_upper"] - raw_dfs["keltner_lower"]
+            )
+
+            # temporal features
+            hourly = time_index.hour / 4  # put in 4-hour bins
+            dow = time_index.dayofweek
+
+            hour_sin = np.sin(2 * np.pi * hourly / 24)
+            hour_cos = np.cos(2 * np.pi * hourly / 24)
+            dow_sin = np.sin(2 * np.pi * dow / 7)
+            dow_cos = np.cos(2 * np.pi * dow / 7)
+
+            derived_dfs["hour_sin"] = pd.DataFrame(
+                {symbol: hour_sin for symbol in all_symbol_list}, index=time_index
+            )
+            derived_dfs["hour_cos"] = pd.DataFrame(
+                {symbol: hour_cos for symbol in all_symbol_list}, index=time_index
+            )
+            derived_dfs["dow_sin"] = pd.DataFrame(
+                {symbol: dow_sin for symbol in all_symbol_list}, index=time_index
+            )
+            derived_dfs["dow_cos"] = pd.DataFrame(
+                {symbol: dow_cos for symbol in all_symbol_list}, index=time_index
+            )
 
             for ind, df in derived_dfs.items():
                 file = DERIVED_CACHE_FILES[ind]
                 print(f"Saving {ind} to cache, shape: {df.shape}")
                 df.to_parquet(file)
                 print(f"Saved {ind} to cache at {file}")
-
-        if all_symbol_list is None:
-            all_symbol_list = self.get_all_symbol_list()
-            if not all_symbol_list:
-                print("No symbols found, exiting.")
-                return
 
         raw_factors = [
             "vwap",
@@ -928,7 +959,6 @@ class OptimizedModel:
             "bb_lower",
             "bb_width",
             "bb_dev",
-            "squeeze_ratio",
             # "keltner_upper",
             # "keltner_lower",
             "stochastic_d",
@@ -946,7 +976,12 @@ class OptimizedModel:
             # "log_return_7d",
             "amount_sum",
             "vol_momentum",
+            "squeeze_ratio",
             "buy_ratio",
+            "hour_sin",
+            "hour_cos",
+            "dow_sin",
+            "dow_cos",
         ]
 
         feature_dfs = {
@@ -988,15 +1023,9 @@ class OptimizedModel:
 
         # Add USDT features
         print("Adding USDT to USD macro features...")
-
-        WINDOW = 96  # 1 day if 15-min bars
         EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
 
         try:
-            time_index = pd.date_range(
-                start=self.start_datetime, end="2024-12-31", freq="15min"
-            )
-
             usdt_usd_df = get_single_symbol_kline_data(
                 "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
             ).reindex(time_index, method="ffill")
@@ -1013,8 +1042,8 @@ class OptimizedModel:
                 .astype("float32")
             )
 
-            rolling_mean = usdt_usd_df["depeg"].rolling(WINDOW).mean()
-            rolling_std = usdt_usd_df["depeg"].rolling(WINDOW).std()
+            rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
+            rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
 
             # Step 3: Z-score (avoid div/0)
             usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - rolling_mean) / (
@@ -1037,8 +1066,12 @@ class OptimizedModel:
             print(f"Error processing USDT_USD data: {e}, skipping")
             raise
 
+        feature_keys = list(feature_dfs.keys())
+
         print("Finished loading factors")
-        print(f"Indicators: {list(feature_dfs.keys())}")
+        print(f"Number of symbols: {len(all_symbol_list)}")
+        print(f"Number of features: {len(feature_keys)}")
+        print(f"Features: {feature_keys}")
 
         df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
 
