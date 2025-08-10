@@ -368,7 +368,7 @@ class OptimizedModel:
         # "log_return_7d",
         "amount_sum",
         "vol_momentum",
-        "buy_pressure_ratio",
+        "buy_ratio",
         "24hour_rtn",
     ]
 
@@ -536,7 +536,7 @@ class OptimizedModel:
         print(
             f"Data memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
         )
-        # print(data.index.memory_usage(deep=True) / 1024**3)
+        print(data.index.memory_usage(deep=True) / 1024**3)
 
         factor_names = list(factor_dfs.keys())
         X = data[factor_names]
@@ -553,7 +553,7 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 256
+        MAX_BINS = 128
         GAP = 32
 
         XGB_PARAMS = {
@@ -561,7 +561,8 @@ class OptimizedModel:
             "learning_rate": 0.02,
             "max_depth": 10,
             "subsample": 0.8,
-            "grow_policy": "lossguide",
+            # "grow_policy": "lossguide",
+            # "max_leaves": 255,
             "min_child_weight": 2,
             "gamma": 0.2,
             "reg_lambda": 2.0,
@@ -569,6 +570,7 @@ class OptimizedModel:
             "colsample_bytree": 0.8,
             "tree_method": "hist",
             "device": self.training_device,
+            "max_bin": MAX_BINS,
             "random_state": 42,
             "eval_metric": "rmse",
         }
@@ -613,7 +615,7 @@ class OptimizedModel:
             f"Training completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
         )
 
-        print("Evaluating Model...")
+        print("Choosing best model and evaluating...")
         BATCH_SIZE = 100_000
 
         n, m = X.shape
@@ -890,14 +892,10 @@ class OptimizedModel:
             # # bollinger width
             # derived_dfs["bollinger_width"] = raw_dfs["bb_upper"] - raw_dfs["bb_lower"]
 
-            # buy pressure
-            derived_dfs["buy_pressure_ratio"] = (
-                raw_dfs["buy_volume"] - (raw_dfs["volume"] - raw_dfs["buy_volume"])
-            ) / raw_dfs["volume"]
-            derived_dfs["buy_pressure_ratio"].replace(
-                [np.inf, -np.inf], np.nan, inplace=True
-            )
-            derived_dfs["buy_pressure_ratio"].fillna(0, inplace=True)
+            # buy ratio
+            derived_dfs["buy_ratio"] = raw_dfs["buy_volume"] / raw_dfs["volume"]
+            derived_dfs["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            derived_dfs["buy_ratio"].fillna(0, inplace=True)
 
             # 24 hour return
             derived_dfs["24hour_rtn"] = (
@@ -933,7 +931,7 @@ class OptimizedModel:
             "squeeze_ratio",
             # "keltner_upper",
             # "keltner_lower",
-            # "stochastic_d",
+            "stochastic_d",
             "cci",
             "mfi",
             "obv",
@@ -948,52 +946,103 @@ class OptimizedModel:
             # "log_return_7d",
             "amount_sum",
             "vol_momentum",
-            "buy_pressure_ratio",
+            "buy_ratio",
         ]
 
-        factor_dfs = {
+        feature_dfs = {
             **{key: raw_dfs[key] for key in raw_factors},
             **{key: derived_dfs[key] for key in derived_factors},
         }
 
-        # market_syms = ["BTCUSDT", "ETHUSDT"]
-        # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
+        # Add BTCUSDT and ETHUSDT for macro features
+        print("Adding BTCUSDT and ETHUSDT macro features...")
 
-        # external_dfs = {}
-        # for factor in market_inds:
-        #     if factor not in factor_dfs:
-        #         print(f"Missing raw factor {factor}, cannot proceed.")
-        #         return
+        market_syms = ["BTCUSDT", "ETHUSDT"]
+        market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
 
-        #     for market_symbol in market_syms:
-        #         combined_col = None
+        for factor in market_inds:
+            if factor not in feature_dfs:
+                print(f"Missing raw factor {factor}, cannot proceed.")
+                return
 
-        #         if market_symbol not in factor_dfs[factor].columns:
-        #             print(
-        #                 f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
-        #             )
-        #             return
-        #         if combined_col is None:
-        #             combined_col = factor_dfs[factor][market_symbol].copy()
-        #         else:
-        #             combined_col += factor_dfs[factor][market_symbol]
+            for market_symbol in market_syms:
+                combined_col = None
 
-        #     external_dfs[f"btc_eth_{factor}"] = pd.DataFrame(
-        #         {
-        #             symbol: combined_col if symbol not in market_syms else np.nan
-        #             for symbol in all_symbol_list
-        #         },
-        #         index=factor_dfs[factor].index,
-        #     )
+                if market_symbol not in feature_dfs[factor].columns:
+                    print(
+                        f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
+                    )
+                    return
+                if combined_col is None:
+                    combined_col = feature_dfs[factor][market_symbol]
+                else:
+                    combined_col += feature_dfs[factor][market_symbol]
 
-        # factor_dfs.update(external_dfs)
+            feature_dfs[f"btc_eth_{factor}"] = pd.DataFrame(
+                {
+                    symbol: combined_col if symbol not in market_syms else np.nan
+                    for symbol in all_symbol_list
+                },
+                index=feature_dfs[factor].index,
+            )
+
+        # Add USDT features
+        print("Adding USDT to USD macro features...")
+
+        WINDOW = 96  # 1 day if 15-min bars
+        EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
+
+        try:
+            time_index = pd.date_range(
+                start=self.start_datetime, end="2024-12-31", freq="15min"
+            )
+
+            usdt_usd_df = get_single_symbol_kline_data(
+                "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
+            ).reindex(time_index, method="ffill")
+
+            usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
+
+            usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
+            usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
+
+            usdt_usd_df["trade_intensity"] = (
+                (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
+                .fillna(0)
+                .astype("float32")
+            )
+
+            rolling_mean = usdt_usd_df["depeg"].rolling(WINDOW).mean()
+            rolling_std = usdt_usd_df["depeg"].rolling(WINDOW).std()
+
+            # Step 3: Z-score (avoid div/0)
+            usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - rolling_mean) / (
+                rolling_std.replace(0, np.nan)
+            )
+
+            features = [
+                "vwap",
+                "depeg_z",
+                "buy_ratio",
+                "trade_intensity",
+            ]
+
+            for feature in features:
+                feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
+                    {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
+                    index=usdt_usd_df[feature].index,
+                )
+        except Exception as e:
+            print(f"Error processing USDT_USD data: {e}, skipping")
+            raise
 
         print("Finished loading factors")
-        print(f"Indicators: {list(factor_dfs.keys())}")
+        print(f"Indicators: {list(feature_dfs.keys())}")
 
         df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
 
-        self.train(df_target, factor_dfs)
+        self.train(df_target, feature_dfs)
 
 
 if __name__ == "__main__":
