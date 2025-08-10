@@ -519,9 +519,8 @@ class OptimizedModel:
             factor = (
                 df.astype(np.float32)
                 .replace([np.inf, -np.inf], np.nan)
-                .fillna(0)
                 .stack()
-                .reindex(common_index, fill_value=0)
+                .reindex(common_index)
             )
 
             factor.name = ind
@@ -543,16 +542,18 @@ class OptimizedModel:
         print(
             f"Data memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
         )
-        print(data.index.memory_usage(deep=True) / 1024**3)
+        print(
+            f"Index memory usage: {data.index.memory_usage(deep=True) / 1024**3:.2f} GB"
+        )
 
         factor_names = list(factor_dfs.keys())
         X = data[factor_names]
-        y = data["target"].replace([np.inf, -np.inf], 0).fillna(0)
+        y = data["target"].replace([np.inf, -np.inf], np.nan)
 
         def make_weights(y_series):
             return np.where(
-                (y_series > y_series.quantile(0.95))
-                | (y_series < y_series.quantile(0.05)),
+                (y_series > y_series.quantile(0.93))
+                | (y_series < y_series.quantile(0.07)),
                 2.0,
                 1.0,
             ).astype(np.float32)
@@ -567,15 +568,15 @@ class OptimizedModel:
         XGB_PARAMS = {
             "objective": "reg:squarederror",
             "learning_rate": 0.02,
-            "max_depth": 10,
-            "subsample": 0.8,
+            "max_depth": 7,
+            "subsample": 0.6,
             # "grow_policy": "lossguide",
             # "max_leaves": 255,
-            "min_child_weight": 4,
-            "gamma": 0.2,
-            "reg_lambda": 2.0,
-            "reg_alpha": 1.0,
-            "colsample_bytree": 0.8,
+            "min_child_weight": 6,
+            "gamma": 1.0,
+            "reg_lambda": 10.0,
+            "reg_alpha": 5.0,
+            "colsample_bytree": 0.6,
             "tree_method": "hist",
             "device": self.training_device,
             "max_bin": MAX_BINS,
@@ -679,12 +680,12 @@ class OptimizedModel:
         # Take average of predictions of all boosters
         data["y_pred"] = y_pred
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
-        data["y_pred"] = data["y_pred"].ewm(span=5).mean()
+        data["y_pred"] = data["y_pred"].ewm(span=3).mean()
 
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
-        OUTPUT_CSV = True
+        OUTPUT_CSV = False
 
         if OUTPUT_CSV:
             print("Saving predictions to CSV...")
@@ -744,15 +745,27 @@ class OptimizedModel:
             df_check.to_csv("check.csv", index=False)
 
             print("Finished saving to csv.")
+        else:
+            print("Skipping CSV output, set OUTPUT_CSV to True to enable.")
+
+        MAX_NUM_FEATURES = 30
 
         print("Plotting feature importance and SHAP summary...")
-        xgb.plot_importance(model, importance_type="gain", max_num_features=20)
+        xgb.plot_importance(
+            best_model,
+            importance_type="gain",
+            max_num_features=MAX_NUM_FEATURES,
+        )
         plt.title("XGBoost Feature Importance (Gain)")
         plt.tight_layout()
         plt.show(block=False)
 
+        plt.figure()
         shap.summary_plot(
-            feature_shap, features=X_for_shap, feature_names=list(X.columns)
+            feature_shap,
+            features=X_for_shap,
+            feature_names=list(X.columns),
+            max_display=MAX_NUM_FEATURES,
         )
         plt.show()
 
@@ -872,18 +885,18 @@ class OptimizedModel:
             print(
                 f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
             )
-            # # 1h_momentum
-            # derived_dfs["1h_momentum"] = (
-            #     raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
-            # )
-            # derived_dfs["1h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            # 1h_momentum
+            derived_dfs["1h_momentum"] = (
+                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
+            )
+            derived_dfs["1h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["1h_momentum"].fillna(0, inplace=True)
 
-            # # 4h_momentum
-            # derived_dfs["4h_momentum"] = (
-            #     raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h) - 1
-            # )
-            # derived_dfs["4h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            # 4h_momentum
+            derived_dfs["4h_momentum"] = (
+                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h) - 1
+            )
+            derived_dfs["4h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["4h_momentum"].fillna(0, inplace=True)
 
             # 7d_momentum
@@ -891,7 +904,7 @@ class OptimizedModel:
                 raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_7d) - 1
             )
             derived_dfs["7d_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["7d_momentum"].fillna(0, inplace=True)
+            # derived_dfs["7d_momentum"].fillna(0, inplace=True)
 
             # # lOG returns
             # derived_dfs["log_return_1h"] = np.log(
@@ -965,31 +978,31 @@ class OptimizedModel:
             # percentage change
             derived_dfs["pct_change"] = raw_dfs["close_price"].pct_change()
             derived_dfs["pct_change"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["pct_change"].fillna(0, inplace=True)
+            # derived_dfs["pct_change"].fillna(0, inplace=True)
 
             # volume factor
             derived_dfs["amount_sum"] = raw_dfs["amount"].rolling(windows_7d).sum()
             derived_dfs["amount_sum"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["amount_sum"].fillna(0, inplace=True)
+            # derived_dfs["amount_sum"].fillna(0, inplace=True)
 
             # volume momentum
             derived_dfs["vol_momentum"] = (
                 raw_dfs["amount"] / raw_dfs["amount"].shift(windows_1d) - 1
             )
             derived_dfs["vol_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["vol_momentum"].fillna(0, inplace=True)
+            # derived_dfs["vol_momentum"].fillna(0, inplace=True)
 
             # buy ratio
             derived_dfs["buy_ratio"] = raw_dfs["buy_volume"] / raw_dfs["volume"]
             derived_dfs["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["buy_ratio"].fillna(0, inplace=True)
+            # derived_dfs["buy_ratio"].fillna(0, inplace=True)
 
             # 24 hour return
             derived_dfs["24hour_rtn"] = (
                 raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1d) - 1
             )
             derived_dfs["24hour_rtn"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            derived_dfs["24hour_rtn"].fillna(0, inplace=True)
+            # derived_dfs["24hour_rtn"].fillna(0, inplace=True)
 
             # squeeze ratio
             derived_dfs["squeeze_ratio"] = raw_dfs["bb_width"] / (
@@ -1043,8 +1056,8 @@ class OptimizedModel:
         ]
 
         derived_factors = [
-            # "1h_momentum",
-            # "4h_momentum",
+            "1h_momentum",
+            "4h_momentum",
             "7d_momentum",
             # "log_return_1h",
             # "log_return_4h",
@@ -1075,9 +1088,17 @@ class OptimizedModel:
         # Add BTCUSDT and ETHUSDT for macro features
         print("Adding BTCUSDT and ETHUSDT macro features...")
 
-        market_syms = ["BTCUSDT", "ETHUSDT"]
+        market_syms = [
+            "BTCUSDT",
+            "ETHUSDT",
+        ]
         # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
-        market_inds = ["vwap", "rsi", "ult_osc", "7d_momentum"]
+        market_inds = [
+            "vwap",
+            "rsi",
+            "ult_osc",
+            "7d_momentum",
+        ]
 
         for factor in market_inds:
             if factor not in feature_dfs:
@@ -1097,7 +1118,7 @@ class OptimizedModel:
                 else:
                     combined_col += feature_dfs[factor][market_symbol]
 
-            feature_dfs[f"btc_eth_{factor}"] = pd.DataFrame(
+            feature_dfs[f"btc_eth_agg_{factor}"] = pd.DataFrame(
                 {
                     symbol: combined_col if symbol not in market_syms else np.nan
                     for symbol in all_symbol_list
@@ -1139,7 +1160,7 @@ class OptimizedModel:
             )
 
             features = [
-                "vwap",
+                # "vwap",
                 "depeg_z",
                 "buy_ratio",
                 "trade_intensity",
