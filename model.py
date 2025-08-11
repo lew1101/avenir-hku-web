@@ -7,6 +7,8 @@ import torch.multiprocessing as mp
 import xgboost as xgb  # type: ignore
 from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
+from hyperopt import fmin, tpe, hp, Trials, STATUS_OK  # type: ignore
+from hyperopt.pyll.base import scope  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import shap  # type: ignore
 
@@ -553,10 +555,10 @@ class OptimizedModel:
         X = data[factor_names]
         y = data["target"].replace([np.inf, -np.inf], np.nan)
 
-        def make_weights(y_series):
+        def _make_weights(y_series):
             return np.where(
-                (y_series > y_series.quantile(0.93))
-                | (y_series < y_series.quantile(0.07)),
+                (y_series > y_series.quantile(0.95))
+                | (y_series < y_series.quantile(0.05)),
                 2.0,
                 1.0,
             ).astype(np.float32)
@@ -564,75 +566,179 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 64
-        GAP = 4 * 24 * 7  # 1 week gap
-        MAX_TRAIN_SIZE = 4 * 24 * 365  # max training of 1 year data
-        NUM_BOOST_ROUNDS = 1500
-        EARLY_STOP_ROUNDS = 150
+        def _compute_q_folds(tscv):
+            # Create QuantileDMatrix for each fold
+            folds = []  # one entry per fold: (d_train, d_val, y_val)
+            for train_t_idx, val_t_idx in tscv.split(uniq_times):
+                train_times = uniq_times[train_t_idx]
+                val_times = uniq_times[val_t_idx]
 
-        XGB_PARAMS = {
-            "objective": "reg:pseudohubererror",
-            "learning_rate": 0.02,
-            # "max_depth": 8,
-            "subsample": 0.6,
-            "grow_policy": "lossguide",
-            "max_leaves": 64,  # start 32–128
-            "min_child_weight": 6,
-            "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
-            "reg_lambda": 2.0,  # penalizes large leaf weights
-            "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
-            "colsample_bytree": 0.8,
-            "colsample_bylevel": 0.8,
-            "tree_method": "hist",
-            "device": self.training_device,
-            "max_bin": MAX_BINS,
-            "random_state": 42,
-            "eval_metric": ["rmse", "mae"],
-        }
+                train_mask = np.isin(times, train_times)
+                val_mask = np.isin(times, val_times)
+
+                X_train, X_val = X[train_mask], X[val_mask]
+                y_train, y_val = y[train_mask], y[val_mask]
+                w_train = _make_weights(y_train)
+
+                d_train = xgb.QuantileDMatrix(
+                    X_train, y_train, weight=w_train, max_bin=MAX_BINS
+                )
+                d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
+
+                folds.append((d_train, d_val, y_val))
+            return folds
+
+        GAP = 4 * 24 * 7  # 1 week gap
+        MAX_TRAIN_SIZE = (
+            4 * 24 * 365
+        )  # max training of 1 year data because regimes change fast
+        MAX_BINS = 64
+        NUM_BOOST_ROUNDS = 1000  #
+        EARLY_STOP_ROUNDS = 150
 
         times = X.index.get_level_values(0).to_numpy()
         uniq_times = np.unique(times)
-        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=MAX_TRAIN_SIZE)
-        best_score = -np.inf
+
+        TUNE_N_SPLITS = 3
+        tscv_tune = TimeSeriesSplit(
+            n_splits=TUNE_N_SPLITS, gap=GAP, max_train_size=MAX_TRAIN_SIZE
+        )
+        tune_folds = _compute_q_folds(tscv_tune)
+
+        STD_PENALTY = 0.2
+
+        def _compute_cv_mean_std(xgb_params):
+            fold_scores = []
+
+            for d_train, d_val, y_val in tune_folds:  # type: ignore
+                booster = xgb.train(
+                    params=xgb_params,
+                    dtrain=d_train,
+                    evals=[(d_train, "train"), (d_val, "val")],
+                    num_boost_round=NUM_BOOST_ROUNDS,
+                    early_stopping_rounds=EARLY_STOP_ROUNDS,
+                    verbose_eval=40,
+                )
+                y_pred = booster.predict(
+                    d_val, iteration_range=(0, booster.best_iteration + 1)
+                )
+                score = self.weighted_spearmanr(y_val, y_pred)
+                fold_scores.append(score)
+
+            return float(np.mean(fold_scores)), float(np.std(fold_scores))
+
+        # XGB_PARAMS = {
+        #     "objective": "reg:pseudohubererror",
+        #     "learning_rate": 0.02,
+        #     # "max_depth": 8,
+        #     "subsample": 0.6,
+        #     "grow_policy": "lossguide",
+        #     "max_leaves": 64,  # start 32–128
+        #     "min_child_weight": 6,
+        #     "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
+        #     "reg_lambda": 2.0,  # penalizes large leaf weights
+        #     "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
+        #     "colsample_bytree": 0.8,
+        #     "colsample_bylevel": 0.8,
+        #     "tree_method": "hist",
+        #     "device": self.training_device,
+        #     "max_bin": MAX_BINS,
+        #     "random_state": 42,
+        #     "eval_metric": ["rmse", "mae"],
+        # }
+
+        search_space = {
+            "objective": "reg:pseudohubererror",
+            "grow_policy": "lossguide",
+            "tree_method": "hist",  # QuantileDMatrix gives hist-like behavior
+            "device": self.training_device,
+            "max_bin": MAX_BINS,
+            "random_state": 42,
+            "eval_metric": "rmse",  # ["rmse", "mae"]
+            "colsample_bylevel": 1.0,
+            "learning_rate": hp.loguniform("learning_rate", np.log(1e-4), np.log(0.2)),
+            "subsample": hp.uniform("subsample", 0.6, 0.9),
+            "colsample_bytree": hp.uniform("colsample_bytree", 0.6, 0.9),
+            # leaves: quantized log-uniform, then cast to int
+            "max_leaves": scope.int(
+                hp.qloguniform("max_leaves", np.log(16), np.log(128), 1)
+            ),
+            "min_child_weight": hp.loguniform(
+                "min_child_weight", np.log(0.1), np.log(50)
+            ),
+            "max_depth": scope.int(hp.quniform("max_depth", 3, 12, 1)),
+            "gamma": hp.loguniform("gamma", np.log(1e-2), np.log(10.0)),
+            "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-3), np.log(100)),
+            "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-5), np.log(0.5)),
+        }
+
+        MAX_EVALS = 50
+        print(f"Begin Hyperparameter Tuning: MAX_EVALS = {MAX_EVALS}")
+
+        trials = Trials()
+
+        def _objective(xgb_params):
+            print(f"Trial {len(trials.trials) + 1}")
+
+            mean, std = _compute_cv_mean_std(xgb_params=xgb_params)
+            robust_score = mean - STD_PENALTY * std
+
+            return {
+                "loss": -robust_score,
+                "status": STATUS_OK,
+                "mean": mean,
+                "std": std,
+                "score": robust_score,
+            }
+
+        best_xgb_params = fmin(
+            fn=_objective,
+            space=search_space,
+            algo=tpe.suggest,
+            max_evals=MAX_EVALS,
+            trials=trials,
+            rstate=np.random.default_rng(42),
+        )
+        best_trial = sorted(trials.results, key=lambda x: x["loss"])[0]
+
+        print(
+            f"Best hyperopt CV weighted Spearman: {best_trial['score']:.4f} with params: {best_xgb_params}"
+        )
+
+        print(f"Retraining on full data with best hyperparameters...")
+        FINAL_N_SPLITS = 5
+        tscv_final = TimeSeriesSplit(
+            n_splits=FINAL_N_SPLITS, gap=GAP, max_train_size=MAX_TRAIN_SIZE
+        )
+        final_folds = _compute_q_folds(tscv_final)
+
         best_model = None
-
-        for fold, (train_t_idx, val_t_idx) in enumerate(tscv.split(uniq_times), start=1):  # type: ignore
-            print(f"Training fold {fold}...")
-
-            train_times = uniq_times[train_t_idx]
-            val_times = uniq_times[val_t_idx]
-
-            # map timestamp folds back to row masks
-            train_mask = np.isin(times, train_times)
-            val_mask = np.isin(times, val_times)
-
-            X_train, X_val = X[train_mask], X[val_mask]
-            y_train, y_val = y[train_mask], y[val_mask]
-            w_train = make_weights(y_train)
-
-            d_train = xgb.QuantileDMatrix(
-                X_train, y_train, weight=w_train, max_bin=MAX_BINS
-            )
-            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
-
-            model = xgb.train(
-                params=XGB_PARAMS,
+        best_score = -np.inf
+        final_scores = []
+        for d_train, d_val, y_val in final_folds:  # type: ignore
+            booster = xgb.train(
+                params=best_xgb_params,
                 dtrain=d_train,
                 evals=[(d_train, "train"), (d_val, "val")],
                 num_boost_round=NUM_BOOST_ROUNDS,
                 early_stopping_rounds=EARLY_STOP_ROUNDS,
-                verbose_eval=20,
+                verbose_eval=False,
             )
 
-            y_pred_val = model.predict(
-                d_val,
-                iteration_range=(0, model.best_iteration + 1),
+            y_pred = booster.predict(
+                d_val, iteration_range=(0, booster.best_iteration + 1)
             )
-            score = self.weighted_spearmanr(y_val, y_pred_val)
-            print(f"Fold {fold} - Weighted Spearman correlation {score:.4f}")
+            score = self.weighted_spearmanr(y_val, y_pred)
             if score > best_score:
                 best_score = score
-                best_model = model
+                best_model = booster
+
+            final_scores.append()
+
+        final_scores = np.asarray(final_scores, dtype=np.float32)
+        print(
+            f"6-fold mean={final_scores.mean():.4f} std={final_scores.std():.4f}  (params={best_xgb_params})"
+        )
 
         elapsed_time = time.monotonic() - t0
         print(
@@ -640,7 +746,8 @@ class OptimizedModel:
         )
 
         print("Choosing best model and evaluating...")
-        BATCH_SIZE = 100_000
+        t0 = time.monotonic()
+        BATCH_SIZE = 300_000
 
         n, m = X.shape
         total_batches = (n - 1) // BATCH_SIZE
@@ -686,12 +793,23 @@ class OptimizedModel:
         # Take average of predictions of all boosters
         data["y_pred"] = y_pred
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
-        data["y_pred"] = data["y_pred"].ewm(span=3).mean()
+        # data["y_pred"] = data["y_pred"].ewm(span=5).mean()
+
+        elapsed_time = time.monotonic() - t0
+        print(
+            f"Predictions completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
+        )
 
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
-        OUTPUT_CSV = False
+        SAVE_MODEL = True
+        if SAVE_MODEL:
+            print("Saving best model...")
+            best_model.save_model("best_xgb_model.json")
+            print("Model saved as 'best_xgb_model.json'")
+
+        OUTPUT_CSV = True
 
         if OUTPUT_CSV:
             print("Saving predictions to CSV...")
