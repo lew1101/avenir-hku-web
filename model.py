@@ -7,7 +7,8 @@ import torch.multiprocessing as mp
 import xgboost as xgb  # type: ignore
 from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
-from hyperopt import fmin, tpe, hp, Trials, STATUS_OK  # type: ignore
+from hyperopt import fmin, tpe, hp, STATUS_OK  # type: ignore
+from hyperopt.fmin import generate_trials_to_calculate  # type: ignore
 from hyperopt.pyll.base import scope  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import shap  # type: ignore
@@ -409,13 +410,12 @@ class OptimizedModel:
     def get_all_symbol_kline(self):
         t0 = time.monotonic()
 
-        try:
-            pool = mp.Pool(processes=PROCESSES)  # use multi core
-
+        loaded_symbols = []
+        df_results = []
+        with mp.Pool(processes=PROCESSES) as pool:  # use multi core
             all_symbol_list = self.get_all_symbol_list()
             if not all_symbol_list:
                 print("No symbols found, exiting.")
-                pool.close()
                 return [], [], [], [], [], [], [], [], [], []
 
             promise_list = [
@@ -426,8 +426,6 @@ class OptimizedModel:
                 for symbol in all_symbol_list
             ]
 
-            loaded_symbols = []
-            df_results = []
             for async_result, symbol in zip(promise_list, all_symbol_list):
                 df = async_result.get()
                 df_results.append(df)
@@ -438,14 +436,6 @@ class OptimizedModel:
                     print(f"{symbol} failed: empty or missing 'vwap'")
             failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
             print(f"Failed symbols: {failed_symbols}")
-
-        except KeyboardInterrupt:
-            pool.terminate()
-            raise
-
-        finally:
-            pool.close()
-            pool.join()
 
         # Clean data
         time_index = pd.date_range(
@@ -593,8 +583,8 @@ class OptimizedModel:
             4 * 24 * 365
         )  # max training of 1 year data because regimes change fast
         MAX_BINS = 64
-        NUM_BOOST_ROUNDS = 1000  #
-        EARLY_STOP_ROUNDS = 150
+        NUM_BOOST_ROUNDS = 1500  #
+        EARLY_STOP_ROUNDS = 80
 
         times = X.index.get_level_values(0).to_numpy()
         uniq_times = np.unique(times)
@@ -624,30 +614,11 @@ class OptimizedModel:
                 )
                 score = self.weighted_spearmanr(y_val, y_pred)
                 fold_scores.append(score)
+                print(f"w_spearmanr: {score}")
 
             return float(np.mean(fold_scores)), float(np.std(fold_scores))
 
-        # XGB_PARAMS = {
-        #     "objective": "reg:pseudohubererror",
-        #     "learning_rate": 0.02,
-        #     # "max_depth": 8,
-        #     "subsample": 0.6,
-        #     "grow_policy": "lossguide",
-        #     "max_leaves": 64,  # start 32–128
-        #     "min_child_weight": 6,
-        #     "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
-        #     "reg_lambda": 2.0,  # penalizes large leaf weights
-        #     "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
-        #     "colsample_bytree": 0.8,
-        #     "colsample_bylevel": 0.8,
-        #     "tree_method": "hist",
-        #     "device": self.training_device,
-        #     "max_bin": MAX_BINS,
-        #     "random_state": 42,
-        #     "eval_metric": ["rmse", "mae"],
-        # }
-
-        search_space = {
+        BASE_XGB_PARAMS = {
             "objective": "reg:pseudohubererror",
             "grow_policy": "lossguide",
             "tree_method": "hist",  # QuantileDMatrix gives hist-like behavior
@@ -655,33 +626,55 @@ class OptimizedModel:
             "max_bin": MAX_BINS,
             "random_state": 42,
             "eval_metric": "rmse",  # ["rmse", "mae"]
-            "colsample_bylevel": 1.0,
+        }
+
+        BEST_XGB_PARAMS_GUESS = {
+            **BASE_XGB_PARAMS,
+            "learning_rate": 0.02,
+            "subsample": 0.6,
+            "colsample_bytree": 0.8,
+            "colsample_bylevel": 0.8,
+            "max_leaves": 64,  # start 32–128
+            "min_child_weight": 6,
+            "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
+            "reg_lambda": 2.0,  # penalizes large leaf weights
+            "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
+        }
+
+        search_space = {
+            **BASE_XGB_PARAMS,
             "learning_rate": hp.loguniform("learning_rate", np.log(1e-4), np.log(0.2)),
-            "subsample": hp.uniform("subsample", 0.6, 0.9),
-            "colsample_bytree": hp.uniform("colsample_bytree", 0.6, 0.9),
+            "subsample": hp.uniform("subsample", 0.5, 1.0),
+            "colsample_bytree": hp.uniform("colsample_bytree", 0.5, 1.0),
+            "colsample_bylevel": hp.uniform("colsample_bytree", 0.5, 1.0),
             # leaves: quantized log-uniform, then cast to int
             "max_leaves": scope.int(
-                hp.qloguniform("max_leaves", np.log(16), np.log(128), 1)
+                hp.qloguniform("max_leaves", np.log(16), np.log(256), 1)
             ),
             "min_child_weight": hp.loguniform(
                 "min_child_weight", np.log(0.1), np.log(50)
             ),
-            "max_depth": scope.int(hp.quniform("max_depth", 3, 12, 1)),
             "gamma": hp.loguniform("gamma", np.log(1e-2), np.log(10.0)),
             "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-3), np.log(100)),
             "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-5), np.log(0.5)),
         }
 
+        assert search_space.keys() == BEST_XGB_PARAMS_GUESS.keys()
+
         MAX_EVALS = 50
         print(f"Begin Hyperparameter Tuning: MAX_EVALS = {MAX_EVALS}")
 
-        trials = Trials()
+        trials = generate_trials_to_calculate([BEST_XGB_PARAMS_GUESS])
 
         def _objective(xgb_params):
             print(f"Trial {len(trials.trials) + 1}")
 
             mean, std = _compute_cv_mean_std(xgb_params=xgb_params)
             robust_score = mean - STD_PENALTY * std
+
+            print(
+                f"Trial {len(trials.trials) + 1} - mean: {mean:.4f}, std: {std:.4f}, robust_score: {robust_score:.4f}"
+            )
 
             return {
                 "loss": -robust_score,
@@ -712,6 +705,12 @@ class OptimizedModel:
         )
         final_folds = _compute_q_folds(tscv_final)
 
+        #
+        best_xgb_params = {
+            **best_xgb_params,
+            "max_leaves": int(best_xgb_params["max_leaves"]),
+        }
+
         best_model = None
         best_score = -np.inf
         final_scores = []
@@ -722,13 +721,15 @@ class OptimizedModel:
                 evals=[(d_train, "train"), (d_val, "val")],
                 num_boost_round=NUM_BOOST_ROUNDS,
                 early_stopping_rounds=EARLY_STOP_ROUNDS,
-                verbose_eval=False,
+                verbose_eval=40,
             )
 
             y_pred = booster.predict(
                 d_val, iteration_range=(0, booster.best_iteration + 1)
             )
             score = self.weighted_spearmanr(y_val, y_pred)
+            print(f"w_spearmanr: {score}")
+
             if score > best_score:
                 best_score = score
                 best_model = booster
@@ -793,7 +794,7 @@ class OptimizedModel:
         # Take average of predictions of all boosters
         data["y_pred"] = y_pred
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
-        # data["y_pred"] = data["y_pred"].ewm(span=5).mean()
+        data["y_pred"] = data["y_pred"].ewm(span=5).mean()
 
         elapsed_time = time.monotonic() - t0
         print(
@@ -804,77 +805,118 @@ class OptimizedModel:
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
         SAVE_MODEL = True
+        MODEL_DIR = "models"
+        MODEL_FILE_NAME = "best_xgb_model.xgb"
+
         if SAVE_MODEL:
-            print("Saving best model...")
-            best_model.save_model("best_xgb_model.json")
-            print("Model saved as 'best_xgb_model.json'")
+            try:
+                os.makedirs(MODEL_DIR, exist_ok=True)  # keep saved models in a folder
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                full_path = os.path.join(MODEL_DIR, f"{timestamp}_{MODEL_FILE_NAME}")
+
+                print(f"Saving best model to {full_path}...")
+                best_model.save_model(full_path)
+                print("Model saved successfully.")
+            except Exception as e:
+                print(f"Error saving model: {e}")
 
         OUTPUT_CSV = True
 
         if OUTPUT_CSV:
-            print("Saving predictions to CSV...")
+            try:
+                print("Saving predictions to CSV...")
 
-            df_submit = data.reset_index(level=0)
-            df_submit = df_submit[["level_0", "y_pred"]]
-            df_submit["symbol"] = df_submit.index.values
-            df_submit = df_submit[["level_0", "symbol", "y_pred"]]
-            df_submit.columns = ["datetime", "symbol", "predict_return"]
+                df_submit = data.reset_index(level=0)
+                df_submit = df_submit[["level_0", "y_pred"]]
+                df_submit["symbol"] = df_submit.index.values
+                df_submit = df_submit[["level_0", "symbol", "y_pred"]]
+                df_submit.columns = ["datetime", "symbol", "predict_return"]
 
-            df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
-            df_submit["id"] = (
-                df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                + "_"
-                + df_submit["symbol"]
-            )
-            df_submit = df_submit[["id", "predict_return"]]
-
-            if os.path.exists(self.sample_submission_path):
-                df_submission_id = pd.read_csv(self.sample_submission_path)
-                # print("Submission ID sample:", df_submission_id.head())
-                id_list = df_submission_id["id"].tolist()
-                print(f"Submission ID count: {len(id_list)}")
-                df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
-                missing_elements = list(set(id_list) - set(df_submit_competion["id"]))
-                print(f"Missing IDs: {len(missing_elements)}")
-                new_rows = pd.DataFrame(
-                    {
-                        "id": missing_elements,
-                        "predict_return": [0] * len(missing_elements),
-                    }
+                df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
+                df_submit["id"] = (
+                    df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                    + "_"
+                    + df_submit["symbol"]
                 )
-                df_submit_competion = pd.concat(
-                    [df_submit_competion, new_rows], ignore_index=True
-                )
-            else:
+                df_submit = df_submit[["id", "predict_return"]]
+
+                if os.path.exists(self.sample_submission_path):
+                    df_submission_id = pd.read_csv(self.sample_submission_path)
+                    # print("Submission ID sample:", df_submission_id.head())
+                    id_list = df_submission_id["id"].tolist()
+                    print(f"Submission ID count: {len(id_list)}")
+                    df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
+                    missing_elements = list(
+                        set(id_list) - set(df_submit_competion["id"])
+                    )
+                    print(f"Missing IDs: {len(missing_elements)}")
+                    new_rows = pd.DataFrame(
+                        {
+                            "id": missing_elements,
+                            "predict_return": [0] * len(missing_elements),
+                        }
+                    )
+                    df_submit_competion = pd.concat(
+                        [df_submit_competion, new_rows], ignore_index=True
+                    )
+                else:
+                    print(
+                        f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
+                    )
+                    df_submit_competion = df_submit
+
+                print("Submission file sample:", df_submit_competion.head())
+                df_submit_competion.to_csv(self.submission_path, index=False)
+
+                SUBMISSION_FILE = "check.csv"
+                CHUNK_SIZE = 1_000_000
                 print(
-                    f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
+                    f"Saving data to {self.cache_dir} in chunks of {CHUNK_SIZE} rows..."
                 )
-                df_submit_competion = df_submit
 
-            print("Submission file sample:", df_submit_competion.head())
-            df_submit_competion.to_csv(self.submission_path, index=False)
+                df_check = data.loc[self.start_datetime :]
+                with open(SUBMISSION_FILE, "w", newline="") as f:
+                    header_written = False
+                    n = len(df_check)
 
-            df_check = data.reset_index(level=0)
-            df_check = df_check[["level_0", "target"]]
-            df_check["symbol"] = df_check.index.values
-            df_check = df_check[["level_0", "symbol", "target"]]
-            df_check.columns = ["datetime", "symbol", "true_return"]
-            df_check = df_check[df_check["datetime"] >= self.start_datetime]
-            df_check["id"] = (
-                df_check["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                + "_"
-                + df_check["symbol"]
-            )
-            df_check = df_check[["id", "true_return"]]
-            df_check.to_csv("check.csv", index=False)
+                    for start in range(0, n, CHUNK_SIZE):
+                        end = min(n, start + CHUNK_SIZE)
+                        chunk = df_check.iloc[start:end]
 
-            print("Finished saving to csv.")
+                        tmp_df = chunk.reset_index(level=0)[["level_0", "target"]]
+
+                        tmp_df["symbol"] = df_check.index.values
+                        tmp_df = tmp_df[["level_0", "symbol", "target"]]
+                        tmp_df.columns = ["datetime", "symbol", "true_return"]
+                        tmp_df["id"] = (
+                            tmp_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                            + "_"
+                            + tmp_df["symbol"]
+                        )
+                        out = tmp_df[["id", "true_return"]]
+                        out.to_csv(f, index=False, header=not header_written)
+
+                        header_written = True
+                print("Finished saving to csv.")
+
+            except Exception as e:
+                print(f"Error saving to CSV: {e}")
+
         else:
             print("Skipping CSV output, set OUTPUT_CSV to True to enable.")
 
         MAX_NUM_FEATURES = 30
 
         print("Plotting feature importance and SHAP summary...")
+        scores = [result["robust_score"] for result in trials.results]
+        iters = np.arange(1, len(scores) + 1)
+
+        plt.plot(iters, scores, marker="o")
+        plt.xlabel("Trial")
+        plt.ylabel("Weighted Spearman (CV mean)")
+        plt.title("Hyperopt Tuning Progress")
+        plt.show(block=False)
+
         xgb.plot_importance(
             best_model,
             importance_type="gain",
