@@ -625,7 +625,7 @@ class OptimizedModel:
             "device": self.training_device,
             "max_bin": MAX_BINS,
             "random_state": 42,
-            "eval_metric": "rmse",  # ["rmse", "mae"]
+            "eval_metric": "mae",  # ["rmse", "mae"]
         }
 
         BEST_XGB_PARAMS_GUESS = {
@@ -646,7 +646,7 @@ class OptimizedModel:
             "learning_rate": hp.loguniform("learning_rate", np.log(1e-4), np.log(0.2)),
             "subsample": hp.uniform("subsample", 0.5, 1.0),
             "colsample_bytree": hp.uniform("colsample_bytree", 0.5, 1.0),
-            "colsample_bylevel": hp.uniform("colsample_bytree", 0.5, 1.0),
+            "colsample_bylevel": hp.uniform("colsample_bylevel", 0.5, 1.0),
             # leaves: quantized log-uniform, then cast to int
             "max_leaves": scope.int(
                 hp.qloguniform("max_leaves", np.log(16), np.log(256), 1)
