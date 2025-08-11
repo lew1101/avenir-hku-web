@@ -333,6 +333,7 @@ def get_all_symbols(train_data_path):
 
 class OptimizedModel:
     RAW_INDICATORS = [
+        "open_price",
         "high_price",
         "low_price",
         "close_price",
@@ -366,12 +367,14 @@ class OptimizedModel:
         # "log_return_4h",
         # "log_return_7d",
         "price_z",
-        "pct_change",
+        # "pct_change",
         "volume_z",
         "amount_sum",
+        "vol_norm_mom",
         "vol_momentum",
         "squeeze_ratio",
         "buy_ratio",
+        "gk_vol",
         "24hour_rtn",
         "hour_sin",
         "hour_cos",
@@ -564,24 +567,27 @@ class OptimizedModel:
         MAX_BINS = 64
         GAP = 4 * 24 * 7  # 1 week gap
         MAX_TRAIN_SIZE = 4 * 24 * 365  # max training of 1 year data
+        NUM_BOOST_ROUNDS = 1500
+        EARLY_STOP_ROUNDS = 150
 
         XGB_PARAMS = {
-            "objective": "reg:squarederror",
+            "objective": "reg:pseudohubererror",
             "learning_rate": 0.02,
-            "max_depth": 7,
+            # "max_depth": 8,
             "subsample": 0.6,
-            # "grow_policy": "lossguide",
-            # "max_leaves": 255,
+            "grow_policy": "lossguide",
+            "max_leaves": 64,  # start 32–128
             "min_child_weight": 6,
-            "gamma": 1.0,
-            "reg_lambda": 10.0,
-            "reg_alpha": 5.0,
-            "colsample_bytree": 0.6,
+            "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
+            "reg_lambda": 2.0,  # penalizes large leaf weights
+            "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
+            "colsample_bytree": 0.8,
+            "colsample_bylevel": 0.8,
             "tree_method": "hist",
             "device": self.training_device,
             "max_bin": MAX_BINS,
             "random_state": 42,
-            "eval_metric": "rmse",
+            "eval_metric": ["rmse", "mae"],
         }
 
         times = X.index.get_level_values(0).to_numpy()
@@ -613,8 +619,8 @@ class OptimizedModel:
                 params=XGB_PARAMS,
                 dtrain=d_train,
                 evals=[(d_train, "train"), (d_val, "val")],
-                num_boost_round=3000,
-                early_stopping_rounds=100,
+                num_boost_round=NUM_BOOST_ROUNDS,
+                early_stopping_rounds=EARLY_STOP_ROUNDS,
                 verbose_eval=20,
             )
 
@@ -931,12 +937,12 @@ class OptimizedModel:
             # )
             # derived_dfs["log_return_7d"].fillna(0, inplace=True)
 
-            # volume_rolling_mean = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).mean()
-            # volume_rolling_std = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).std()
+            volume_rolling_mean = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).mean()
+            volume_rolling_std = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).std()
 
-            # derived_dfs["volume_z"] = (raw_dfs["volume"] - volume_rolling_mean) / (
-            #     volume_rolling_std.replace(0, np.nan)
-            # )
+            derived_dfs["volume_z"] = (raw_dfs["volume"] - volume_rolling_mean) / (
+                volume_rolling_std.replace(0, np.nan)
+            )
 
             # price z-score
             price_rolling_mean = raw_dfs["close_price"].rolling(Z_SCORE_WINDOW).mean()
@@ -975,15 +981,23 @@ class OptimizedModel:
 
             derived_dfs["ult_osc"] = 100.0 * (4 * avg1 + 2 * avg2 + 1 * avg3) / 7.0
 
-            # percentage change
-            derived_dfs["pct_change"] = raw_dfs["close_price"].pct_change()
-            derived_dfs["pct_change"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # derived_dfs["pct_change"].fillna(0, inplace=True)
+            # # percentage change
+            # derived_dfs["pct_change"] = raw_dfs["close_price"].pct_change()
+            # derived_dfs["pct_change"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            # # derived_dfs["pct_change"].fillna(0, inplace=True)
 
             # volume factor
             derived_dfs["amount_sum"] = raw_dfs["amount"].rolling(windows_7d).sum()
             derived_dfs["amount_sum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["amount_sum"].fillna(0, inplace=True)
+
+            k = windows_1d  # 6 hr lookback
+            returns = raw_dfs["vwap"].pct_change()  # or absolute change
+            vol = returns.rolling(k).std()
+
+            derived_dfs["vol_norm_mom"] = (
+                raw_dfs["vwap"] - raw_dfs["vwap"].shift(k)
+            ) / vol.replace(0, np.nan)
 
             # volume momentum
             derived_dfs["vol_momentum"] = (
@@ -1008,6 +1022,16 @@ class OptimizedModel:
             derived_dfs["squeeze_ratio"] = raw_dfs["bb_width"] / (
                 raw_dfs["keltner_upper"] - raw_dfs["keltner_lower"]
             )
+
+            # garman-klass volatility
+            GK_WINDOW = windows_1h
+            log_hl = np.log(raw_dfs["high_price"] / raw_dfs["low_price"])  # log range
+            log_co = np.log(
+                raw_dfs["close_price"] / raw_dfs["open_price"]
+            )  # log close-open
+
+            rs = 0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2
+            derived_dfs["gk_vol"] = np.sqrt(rs.rolling(GK_WINDOW).mean())
 
             # temporal features
             hourly = time_index.hour / 4  # put in 4-hour bins
@@ -1038,8 +1062,8 @@ class OptimizedModel:
                 print(f"Saved {ind} to cache at {file}")
 
         raw_factors = [
-            "vwap",
-            # "vwap_deviation",
+            # "vwap",
+            "vwap_deviation",
             "atr",
             "macd",
             "rsi",
@@ -1063,12 +1087,15 @@ class OptimizedModel:
             # "log_return_4h",
             # "log_return_7d",
             "price_z",
-            "pct_change",
+            # "pct_change",
             "ult_osc",
-            # "volume_z",
+            "volume_z",
             "amount_sum",
+            # "vol_norm_mom",
             "vol_momentum",
             "squeeze_ratio",
+            # "gk_vol",
+            "24hour_rtn",
             "buy_ratio",
             "hour_sin",
             "hour_cos",
@@ -1094,9 +1121,12 @@ class OptimizedModel:
         ]
         # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
         market_inds = [
-            "vwap",
-            "rsi",
+            "vwap_deviation",
             "ult_osc",
+            "rsi",
+            # "vol_norm_mom",
+            # "1h_momentum",
+            # "4h_momentum",
             "7d_momentum",
         ]
 
@@ -1126,6 +1156,28 @@ class OptimizedModel:
                 index=feature_dfs[factor].index,
             )
 
+        # Calculate Beta
+        BETA_LOOKBACK_WINDOW = 90  # bars in your lookback, e.g. 90 day
+        BENCH_SYMBOL = "BTCUSDT"
+
+        rets = raw_dfs["close_price"].pct_change()
+        bench_ret = rets[BENCH_SYMBOL]
+
+        rolling_var = bench_ret.rolling(
+            BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
+        ).var()
+        rolling_cov = rets.rolling(
+            BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
+        ).cov(bench_ret)
+
+        beta_df = rolling_cov.div(rolling_var, axis=0)
+
+        beta_z_df = beta_df.apply(
+            lambda col: (col - col.mean()) / col.std(ddof=0), axis=0
+        )
+        beta_z_df = beta_z_df.drop(columns=[BENCH_SYMBOL], errors="ignore")
+        feature_dfs["btc_beta_z"] = beta_z_df.ffill()
+
         # Add USDT features
         print("Adding USDT to USD macro features...")
         EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
@@ -1135,38 +1187,48 @@ class OptimizedModel:
                 "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
             ).reindex(time_index, method="ffill")
 
-            usdt_usd_df["depeg"] = (
-                usdt_usd_df["close_price"] - 1.0
-            )  # USDT is a 1:1 peg to USD
+            # USDT is a 1:1 peg to USD
+            usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
+
             usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            usdt_usd_df["depeg"].fillna(0, inplace=True)
+            # usdt_usd_df["depeg"].fillna(0, inplace=True)
+
+            # USDT is a 1:1 peg to USD
+            # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
+            # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
+
+            # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
+            # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
             usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
             usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
+            # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
 
             usdt_usd_df["trade_intensity"] = (
                 (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
-                .fillna(0)
+                # .fillna(0)
                 .astype("float32")
             )
 
-            depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
-            depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
+            # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
+            # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
 
-            # Step 3: Z-score (avoid div/0)
-            usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
-                depeg_rolling_std.replace(0, np.nan)
-            )
+            # # Step 3: Z-score (avoid div/0)
+            # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
+            #     depeg_rolling_std.replace(0, np.nan)
+            # )
 
-            features = [
+            USDT_FEATURES = [
                 # "vwap",
-                "depeg_z",
+                "depeg",
+                # "depeg_z",
+                # "depeg_low",
+                # "depeg_high",
                 "buy_ratio",
                 "trade_intensity",
             ]
 
-            for feature in features:
+            for feature in USDT_FEATURES:
                 feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
                     {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
                     index=usdt_usd_df[feature].index,
