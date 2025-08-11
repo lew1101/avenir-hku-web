@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import shap  # type: ignore
+from old_utils import process_cache 
 
 PROCESSING_DEVICE = "cpu"
 TRAIN_DEVICE = "cuda"
@@ -18,6 +19,8 @@ TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
 TRAIN_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 SAMPLE_SUBMISSION_PATH = os.path.join(BASE_DIR, "sample_submission.csv")
 SUBMISSION_PATH = os.path.join(BASE_DIR, "submit.csv")
+RECENT_DATA_DIR = os.path.join(BASE_DIR, "2025_data")
+RECENT_DATA_CACHE_DIR = os.path.join(BASE_DIR, "2025_data_cache")
 
 
 def compute_factors_torch(df, device):
@@ -380,6 +383,7 @@ class OptimizedModel:
         "hour_cos",
         "dow_sin",
         "dow_cos",
+        # "adx",
     ]
 
     def __init__(self):
@@ -391,11 +395,13 @@ class OptimizedModel:
         self.processing_device = PROCESSING_DEVICE
         self.training_device = TRAIN_DEVICE
         self.cache_dir = TRAIN_CACHE_DIR
+        self.recent_train_data_path = RECENT_DATA_DIR
+        self.recent_cache_dir = RECENT_DATA_CACHE_DIR
         print(f"Using device: {self.processing_device}")
 
-    def get_all_symbol_list(self):
+    def get_all_symbol_list(self, train_data_path):
         try:
-            parquet_name_list = os.listdir(self.train_data_path)
+            parquet_name_list = os.listdir(train_data_path)
             symbol_list = [
                 parquet_name.split(".")[0] for parquet_name in parquet_name_list
             ]
@@ -404,13 +410,13 @@ class OptimizedModel:
             print(f"Error in get_all_symbol_list: {e}")
             return []
 
-    def get_all_symbol_kline(self):
+    def get_all_symbol_kline(self, train_data_path):
         t0 = time.monotonic()
 
         try:
             pool = mp.Pool(processes=PROCESSES)  # use multi core
 
-            all_symbol_list = self.get_all_symbol_list()
+            all_symbol_list = self.get_all_symbol_list(train_data_path)
             if not all_symbol_list:
                 print("No symbols found, exiting.")
                 pool.close()
@@ -419,7 +425,7 @@ class OptimizedModel:
             promise_list = [
                 pool.apply_async(
                     get_single_symbol_kline_data,
-                    (symbol, self.train_data_path, self.processing_device),
+                    (symbol, train_data_path, self.processing_device),
                 )
                 for symbol in all_symbol_list
             ]
@@ -508,14 +514,19 @@ class OptimizedModel:
         var_pred = (w * (r_pred - mu_pred) ** 2).sum()
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
 
-    def train(self, df_target, factor_dfs):
+    def prepare_data(self, df_target, factor_dfs):
         print("Preparing data for training...")
         t0 = time.monotonic()
-
+        print(f"Target shape: {df_target.shape}, Factor shapes: {[df.shape for df in factor_dfs.values()]}")   
+        print(f"Target memory usage: {df_target.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
+        total_gb = sum(df.memory_usage(deep=True).sum() for df in factor_dfs.values()) / 1024**3
+        print(f"Total factor memory usage: {total_gb:.2f} GB")
         target_long = df_target.astype(np.float32).stack()
         target_long.name = "target"
 
         common_index = target_long.index
+        print(f"common index: {common_index}")
+        print(f"Common index length: {len(common_index)}")
 
         factor_long = []
         for ind, df in factor_dfs.items():
@@ -536,7 +547,12 @@ class OptimizedModel:
             ],
             axis=1,
         )
-
+        
+        factor_names = list(factor_dfs.keys())
+        X = data[factor_names]
+        y = data["target"].replace([np.inf, -np.inf], np.nan)
+        # X = X.loc[y.index]  # align X with y
+        
         elapsed_time = time.monotonic() - t0
         print(
             f"Data processing completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
@@ -548,11 +564,10 @@ class OptimizedModel:
         print(
             f"Index memory usage: {data.index.memory_usage(deep=True) / 1024**3:.2f} GB"
         )
-
-        factor_names = list(factor_dfs.keys())
-        X = data[factor_names]
-        y = data["target"].replace([np.inf, -np.inf], np.nan)
-
+        
+        return data, X, y
+    
+    def train(self, data, X, y, X_recent, y_recent):
         def make_weights(y_series):
             return np.where(
                 (y_series > y_series.quantile(0.93))
@@ -564,7 +579,7 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 64
+        MAX_BINS = 256
         GAP = 4 * 24 * 7  # 1 week gap
         MAX_TRAIN_SIZE = 4 * 24 * 365  # max training of 1 year data
         NUM_BOOST_ROUNDS = 1500
@@ -572,7 +587,7 @@ class OptimizedModel:
 
         XGB_PARAMS = {
             "objective": "reg:pseudohubererror",
-            "learning_rate": 0.02,
+            "learning_rate": 0.01,
             # "max_depth": 8,
             "subsample": 0.6,
             "grow_policy": "lossguide",
@@ -581,7 +596,7 @@ class OptimizedModel:
             "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
             "reg_lambda": 2.0,  # penalizes large leaf weights
             "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
-            "colsample_bytree": 0.8,
+            "colsample_bytree": 0.7,
             "colsample_bylevel": 0.8,
             "tree_method": "hist",
             "device": self.training_device,
@@ -591,6 +606,7 @@ class OptimizedModel:
         }
 
         times = X.index.get_level_values(0).to_numpy()
+        X_scaled = self.scaler.fit_transform(X)
         uniq_times = np.unique(times)
         tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=MAX_TRAIN_SIZE)
         best_score = -np.inf
@@ -606,14 +622,14 @@ class OptimizedModel:
             train_mask = np.isin(times, train_times)
             val_mask = np.isin(times, val_times)
 
-            X_train, X_val = X[train_mask], X[val_mask]
+            X_train, X_val = X_scaled[train_mask], X_scaled[val_mask]
             y_train, y_val = y[train_mask], y[val_mask]
             w_train = make_weights(y_train)
 
             d_train = xgb.QuantileDMatrix(
                 X_train, y_train, weight=w_train, max_bin=MAX_BINS
             )
-            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
+            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS, ref = d_train)
 
             model = xgb.train(
                 params=XGB_PARAMS,
@@ -690,6 +706,11 @@ class OptimizedModel:
 
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
+        
+        X_recent_scaled = self.scaler.fit_transform(X_recent)
+        prediction = best_model.predict(X_recent_scaled).replace([np.inf, -np.inf], 0).fillna(0).ewm(span=3).mean()
+        recent_rho_overall = self.weighted_spearmanr(y_recent, prediction)
+        print(f"Weighted Spearman correlation coefficient (recent): {recent_rho_overall:.4f}")
 
         OUTPUT_CSV = False
 
@@ -775,20 +796,15 @@ class OptimizedModel:
         )
         plt.show()
 
-    def run(self):
-        print("Train data directory contents:", os.listdir(self.train_data_path))
-
-        os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
-        print("Cache directory contents:", os.listdir(self.cache_dir))
-
+    def process_cache(self, train_data_path, cache_dir):
         # Separate cache files for raw and derived indicators
         RAW_CACHE_FILES = {
-            key: os.path.join(self.cache_dir, f"df_{key}.parquet")
+            key: os.path.join(cache_dir, f"df_{key}.parquet")
             for key in self.RAW_INDICATORS
         }
 
         DERIVED_CACHE_FILES = {
-            key: os.path.join(self.cache_dir, f"df_{key}.parquet")
+            key: os.path.join(cache_dir, f"df_{key}.parquet")
             for key in self.DERIVED_INDICATORS
         }
 
@@ -812,7 +828,7 @@ class OptimizedModel:
 
         raw_dfs = {}
         if use_raw_cache:
-            print(f'Found raw indicator cache "{self.cache_dir}", using cached data.')
+            print(f'Found raw indicator cache "{cache_dir}", using cached data.')
 
             for ind in self.RAW_INDICATORS:
                 try:
@@ -826,10 +842,10 @@ class OptimizedModel:
 
         if not use_raw_cache:
             print(
-                f'Cannot find all raw indicator cache files in "{self.cache_dir}", recalculating raw indicators.'
+                f'Cannot find all raw indicator cache files in "{cache_dir}", recalculating raw indicators.'
             )
 
-            (all_symbol_list, time_arr, raw_ind_arrays) = self.get_all_symbol_kline()
+            (all_symbol_list, time_arr, raw_ind_arrays) = self.get_all_symbol_kline(train_data_path=train_data_path)
 
             if not all_symbol_list:
                 print("No data loaded, exiting.")
@@ -860,9 +876,11 @@ class OptimizedModel:
         time_index = pd.date_range(
             start=self.start_datetime, end="2024-12-31", freq="15min"
         )
+        
+        # technically could change for the 2025 data but processing wise is purely symbolic
 
         if all_symbol_list is None:
-            all_symbol_list = self.get_all_symbol_list()
+            all_symbol_list = self.get_all_symbol_list(train_data_path=train_data_path)
             if not all_symbol_list:
                 print("No symbols found, exiting.")
                 return
@@ -874,7 +892,7 @@ class OptimizedModel:
         derived_dfs = {}
         if use_derived_cache:
             print(
-                f'Found all derived indicators in cache "{self.cache_dir}", using cached data.'
+                f'Found all derived indicators in cache "{cache_dir}", using cached data.'
             )
 
             for ind in self.DERIVED_INDICATORS:
@@ -889,7 +907,7 @@ class OptimizedModel:
 
         if not use_derived_cache:
             print(
-                f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
+                f'Cannot find derived indicator cache files in "{cache_dir}", recalculating derived indicators.'
             )
             # 1h_momentum
             derived_dfs["1h_momentum"] = (
@@ -951,6 +969,21 @@ class OptimizedModel:
             derived_dfs["price_z"] = (
                 raw_dfs["close_price"] - price_rolling_mean
             ) / price_rolling_std.replace(0, np.nan)
+
+            # # adx
+            # high_low = raw_dfs["high_price"] - raw_dfs["low_price"]
+            # high_close = np.abs(raw_dfs["high_price"] - raw_dfs["close_price"].shift(1))
+            # low_close = np.abs(raw_dfs["low_price"] - raw_dfs["close_price"].shift(1))
+            # true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
+            # adx = pd.Series(dtype=float)
+            # for i in range(1, len(true_range)):
+            #     if i < 14:
+            #         adx[i] = np.nan
+            #     else:
+            #         adx[i] = (adx[i - 1] * 13 + true_range[i]) / 14
+
+            # derived_dfs["adx"] = adx
 
             # ultimate oscillator
             prev_close = raw_dfs["close_price"].shift(1)
@@ -1069,7 +1102,7 @@ class OptimizedModel:
             "rsi",
             "bb_upper",
             "bb_lower",
-            "bb_width",
+            # "bb_width",
             "bb_dev",
             # "keltner_upper",
             # "keltner_lower",
@@ -1093,7 +1126,7 @@ class OptimizedModel:
             "amount_sum",
             # "vol_norm_mom",
             "vol_momentum",
-            "squeeze_ratio",
+            # "squeeze_ratio",
             # "gk_vol",
             "24hour_rtn",
             "buy_ratio",
@@ -1101,152 +1134,169 @@ class OptimizedModel:
             "hour_cos",
             "dow_sin",
             "dow_cos",
+            # "adx",
         ]
 
         feature_dfs = {
             **{key: raw_dfs[key] for key in raw_factors},
             **{key: derived_dfs[key] for key in derived_factors},
         }
+        
+        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
+
+        return feature_dfs, df_target
+
+    def run(self):
+        print("Train data directory contents:", os.listdir(self.train_data_path))
+
+        os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
+        print("Cache directory contents:", os.listdir(self.cache_dir))
+
+        feature_dfs, df_target = self.process_cache(self.train_data_path, self.cache_dir)
+        recent_feature_dfs, recent_df_target = self.process_cache(self.recent_train_data_path, self.recent_cache_dir)
 
         # ================
         # External indicators
         # ================
 
-        # Add BTCUSDT and ETHUSDT for macro features
-        print("Adding BTCUSDT and ETHUSDT macro features...")
+        # # Add BTCUSDT and ETHUSDT for macro features
+        # print("Adding BTCUSDT and ETHUSDT macro features...")
 
-        market_syms = [
-            "BTCUSDT",
-            "ETHUSDT",
-        ]
-        # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
-        market_inds = [
-            "vwap_deviation",
-            "ult_osc",
-            "rsi",
-            # "vol_norm_mom",
-            # "1h_momentum",
-            # "4h_momentum",
-            "7d_momentum",
-        ]
+        # market_syms = [
+        #     "BTCUSDT",
+        #     "ETHUSDT",
+        # ]
+        # # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
+        # market_inds = [
+        #     "vwap_deviation",
+        #     "ult_osc",
+        #     "rsi",
+        #     # "vol_norm_mom",
+        #     # "1h_momentum",
+        #     # "4h_momentum",
+        #     "7d_momentum",
+        # ]
 
-        for factor in market_inds:
-            if factor not in feature_dfs:
-                print(f"Missing raw factor {factor}, cannot proceed.")
-                return
+        # for factor in market_inds:
+        #     if factor not in feature_dfs:
+        #         print(f"Missing raw factor {factor}, cannot proceed.")
+        #         return
 
-            for market_symbol in market_syms:
-                combined_col = None
+        #     for market_symbol in market_syms:
+        #         combined_col = None
 
-                if market_symbol not in feature_dfs[factor].columns:
-                    print(
-                        f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
-                    )
-                    return
-                if combined_col is None:
-                    combined_col = feature_dfs[factor][market_symbol]
-                else:
-                    combined_col += feature_dfs[factor][market_symbol]
+        #         if market_symbol not in feature_dfs[factor].columns:
+        #             print(
+        #                 f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
+        #             )
+        #             return
+        #         if combined_col is None:
+        #             combined_col = feature_dfs[factor][market_symbol]
+        #         else:
+        #             combined_col += feature_dfs[factor][market_symbol]
 
-            feature_dfs[f"btc_eth_agg_{factor}"] = pd.DataFrame(
-                {
-                    symbol: combined_col if symbol not in market_syms else np.nan
-                    for symbol in all_symbol_list
-                },
-                index=feature_dfs[factor].index,
-            )
+        #     feature_dfs[f"btc_eth_agg_{factor}"] = pd.DataFrame(
+        #         {
+        #             symbol: combined_col 
+        #             for symbol in all_symbol_list
+        #         },
+        #         index=feature_dfs[factor].index,
+        #     )
 
-        # Calculate Beta
-        BETA_LOOKBACK_WINDOW = 90  # bars in your lookback, e.g. 90 day
-        BENCH_SYMBOL = "BTCUSDT"
+        # # Calculate Beta
+        # BETA_LOOKBACK_WINDOW = 90  # bars in your lookback, e.g. 90 day
+        # BENCH_SYMBOL = "BTCUSDT"
 
-        rets = raw_dfs["close_price"].pct_change()
-        bench_ret = rets[BENCH_SYMBOL]
+        # rets = raw_dfs["close_price"].pct_change()
+        # bench_ret = rets[BENCH_SYMBOL]
 
-        rolling_var = bench_ret.rolling(
-            BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
-        ).var()
-        rolling_cov = rets.rolling(
-            BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
-        ).cov(bench_ret)
+        # rolling_var = bench_ret.rolling(
+        #     BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
+        # ).var()
+        # rolling_cov = rets.rolling(
+        #     BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
+        # ).cov(bench_ret)
 
-        beta_df = rolling_cov.div(rolling_var, axis=0)
+        # beta_df = rolling_cov.div(rolling_var, axis=0)
 
-        beta_z_df = beta_df.apply(
-            lambda col: (col - col.mean()) / col.std(ddof=0), axis=0
-        )
-        beta_z_df = beta_z_df.drop(columns=[BENCH_SYMBOL], errors="ignore")
-        feature_dfs["btc_beta_z"] = beta_z_df.ffill()
+        # beta_z_df = beta_df.apply(
+        #     lambda col: (col - col.mean()) / col.std(ddof=0), axis=0
+        # )
+        # beta_z_df = beta_z_df.drop(columns=[BENCH_SYMBOL], errors="ignore")
+        # feature_dfs["btc_beta_z"] = beta_z_df.ffill()
 
-        # Add USDT features
-        print("Adding USDT to USD macro features...")
-        EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
+        # # Add USDT features
+        # print("Adding USDT to USD macro features...")
+        # EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
 
-        try:
-            usdt_usd_df = get_single_symbol_kline_data(
-                "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
-            ).reindex(time_index, method="ffill")
+        # try:
+        #     usdt_usd_df = get_single_symbol_kline_data(
+        #         "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
+        #     ).reindex(time_index, method="ffill")
 
-            # USDT is a 1:1 peg to USD
-            usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
+        #     # USDT is a 1:1 peg to USD
+        #     usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
 
-            usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # usdt_usd_df["depeg"].fillna(0, inplace=True)
+        #     usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["depeg"].fillna(0, inplace=True)
 
-            # USDT is a 1:1 peg to USD
-            # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
-            # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # USDT is a 1:1 peg to USD
+        #     # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
+        #     # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-            # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
-            # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
+        #     # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-            usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
-            usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
+        #     usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
+        #     usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
 
-            usdt_usd_df["trade_intensity"] = (
-                (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
-                # .fillna(0)
-                .astype("float32")
-            )
+        #     usdt_usd_df["trade_intensity"] = (
+        #         (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
+        #         # .fillna(0)
+        #         .astype("float32")
+        #     )
 
-            # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
-            # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
+        #     # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
+        #     # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
 
-            # # Step 3: Z-score (avoid div/0)
-            # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
-            #     depeg_rolling_std.replace(0, np.nan)
-            # )
+        #     # # Step 3: Z-score (avoid div/0)
+        #     # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
+        #     #     depeg_rolling_std.replace(0, np.nan)
+        #     # )
 
-            USDT_FEATURES = [
-                # "vwap",
-                "depeg",
-                # "depeg_z",
-                # "depeg_low",
-                # "depeg_high",
-                "buy_ratio",
-                "trade_intensity",
-            ]
+        #     USDT_FEATURES = [
+        #         # "vwap",
+        #         "depeg",
+        #         # "depeg_z",
+        #         # "depeg_low",
+        #         # "depeg_high",
+        #         "buy_ratio",
+        #         "trade_intensity",
+        #     ]
 
-            for feature in USDT_FEATURES:
-                feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
-                    {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
-                    index=usdt_usd_df[feature].index,
-                )
-        except Exception as e:
-            print(f"Error processing USDT_USD data: {e}, skipping")
-            raise
+        #     for feature in USDT_FEATURES:
+        #         feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
+        #             {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
+        #             index=usdt_usd_df[feature].index,
+        #         )
+        # except Exception as e:
+        #     print(f"Error processing USDT_USD data: {e}, skipping")
+        #     raise
 
         feature_keys = list(feature_dfs.keys())
 
         print("Finished loading factors")
-        print(f"Number of symbols: {len(all_symbol_list)}")
+        # print(f"Number of symbols: {len(all_symbol_list)}")
         print(f"Number of features: {len(feature_keys)}")
         print(f"Features: {feature_keys}")
 
-        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
+        
 
-        self.train(df_target, feature_dfs)
+        data, X, y = self.prepare_data(df_target, feature_dfs)
+        data_recent, X_recent, y_recent = self.prepare_data(recent_df_target, recent_feature_dfs)
+
+        self.train(data, X, y, X_recent, y_recent)
 
 
 if __name__ == "__main__":
