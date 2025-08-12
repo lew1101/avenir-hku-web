@@ -566,7 +566,7 @@ class OptimizedModel:
 
         MAX_BINS = 64
         GAP = 4 * 24 * 7  # 1 week gap
-        MAX_TRAIN_SIZE = 4 * 24 * 365  # max training of 1 year data
+        TEST_SIZE = 4 * 24 * 365  # max training of 1 year data
         NUM_BOOST_ROUNDS = 1500
         EARLY_STOP_ROUNDS = 150
 
@@ -592,7 +592,7 @@ class OptimizedModel:
 
         times = X.index.get_level_values(0).to_numpy()
         uniq_times = np.unique(times)
-        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=MAX_TRAIN_SIZE)
+        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, test_size=TEST_SIZE)
         best_score = -np.inf
         best_model = None
 
@@ -691,66 +691,104 @@ class OptimizedModel:
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 
+        SAVE_MODEL = True
+        MODEL_DIR = "models"
+        MODEL_FILE_NAME = "best_xgb_model.xgb"
+
+        if SAVE_MODEL:
+            try:
+                os.makedirs(MODEL_DIR, exist_ok=True)  # keep saved models in a folder
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                full_path = os.path.join(MODEL_DIR, f"{timestamp}_{MODEL_FILE_NAME}")
+
+                print(f"Saving best model to {full_path}...")
+                best_model.save_model(full_path)
+                print("Model saved successfully.")
+            except Exception as e:
+                print(f"Error saving model: {e}")
+
         OUTPUT_CSV = False
 
         if OUTPUT_CSV:
-            print("Saving predictions to CSV...")
+            try:
+                print("Saving predictions to CSV...")
 
-            df_submit = data.reset_index(level=0)
-            df_submit = df_submit[["level_0", "y_pred"]]
-            df_submit["symbol"] = df_submit.index.values
-            df_submit = df_submit[["level_0", "symbol", "y_pred"]]
-            df_submit.columns = ["datetime", "symbol", "predict_return"]
+                df_submit = data.reset_index(level=0)
+                df_submit = df_submit[["level_0", "y_pred"]]
+                df_submit["symbol"] = df_submit.index.values
+                df_submit = df_submit[["level_0", "symbol", "y_pred"]]
+                df_submit.columns = ["datetime", "symbol", "predict_return"]
 
-            df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
-            df_submit["id"] = (
-                df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                + "_"
-                + df_submit["symbol"]
-            )
-            df_submit = df_submit[["id", "predict_return"]]
-
-            if os.path.exists(self.sample_submission_path):
-                df_submission_id = pd.read_csv(self.sample_submission_path)
-                # print("Submission ID sample:", df_submission_id.head())
-                id_list = df_submission_id["id"].tolist()
-                print(f"Submission ID count: {len(id_list)}")
-                df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
-                missing_elements = list(set(id_list) - set(df_submit_competion["id"]))
-                print(f"Missing IDs: {len(missing_elements)}")
-                new_rows = pd.DataFrame(
-                    {
-                        "id": missing_elements,
-                        "predict_return": [0] * len(missing_elements),
-                    }
+                df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
+                df_submit["id"] = (
+                    df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                    + "_"
+                    + df_submit["symbol"]
                 )
-                df_submit_competion = pd.concat(
-                    [df_submit_competion, new_rows], ignore_index=True
-                )
-            else:
+                df_submit = df_submit[["id", "predict_return"]]
+
+                if os.path.exists(self.sample_submission_path):
+                    df_submission_id = pd.read_csv(self.sample_submission_path)
+                    # print("Submission ID sample:", df_submission_id.head())
+                    id_list = df_submission_id["id"].tolist()
+                    print(f"Submission ID count: {len(id_list)}")
+                    df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
+                    missing_elements = list(
+                        set(id_list) - set(df_submit_competion["id"])
+                    )
+                    print(f"Missing IDs: {len(missing_elements)}")
+                    new_rows = pd.DataFrame(
+                        {
+                            "id": missing_elements,
+                            "predict_return": [0] * len(missing_elements),
+                        }
+                    )
+                    df_submit_competion = pd.concat(
+                        [df_submit_competion, new_rows], ignore_index=True
+                    )
+                else:
+                    print(
+                        f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
+                    )
+                    df_submit_competion = df_submit
+
+                print("Submission file sample:", df_submit_competion.head())
+                df_submit_competion.to_csv(self.submission_path, index=False)
+
+                SUBMISSION_FILE = "check.csv"
+                CHUNK_SIZE = 1_000_000
                 print(
-                    f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
+                    f"Saving data to {self.cache_dir} in chunks of {CHUNK_SIZE} rows..."
                 )
-                df_submit_competion = df_submit
 
-            print("Submission file sample:", df_submit_competion.head())
-            df_submit_competion.to_csv(self.submission_path, index=False)
+                df_check = data.loc[self.start_datetime :]
+                with open(SUBMISSION_FILE, "w", newline="") as f:
+                    header_written = False
+                    n = len(df_check)
 
-            df_check = data.reset_index(level=0)
-            df_check = df_check[["level_0", "target"]]
-            df_check["symbol"] = df_check.index.values
-            df_check = df_check[["level_0", "symbol", "target"]]
-            df_check.columns = ["datetime", "symbol", "true_return"]
-            df_check = df_check[df_check["datetime"] >= self.start_datetime]
-            df_check["id"] = (
-                df_check["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                + "_"
-                + df_check["symbol"]
-            )
-            df_check = df_check[["id", "true_return"]]
-            df_check.to_csv("check.csv", index=False)
+                    for start in range(0, n, CHUNK_SIZE):
+                        end = min(n, start + CHUNK_SIZE)
+                        chunk = df_check.iloc[start:end]
 
-            print("Finished saving to csv.")
+                        tmp_df = chunk.reset_index(level=0)[["level_0", "target"]]
+
+                        tmp_df["symbol"] = df_check.index.values
+                        tmp_df = tmp_df[["level_0", "symbol", "target"]]
+                        tmp_df.columns = ["datetime", "symbol", "true_return"]
+                        tmp_df["id"] = (
+                            tmp_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                            + "_"
+                            + tmp_df["symbol"]
+                        )
+                        out = tmp_df[["id", "true_return"]]
+                        out.to_csv(f, index=False, header=not header_written)
+
+                        header_written = True
+                print("Finished saving to csv.")
+
+            except Exception as e:
+                print(f"Error saving to CSV: {e}")
+
         else:
             print("Skipping CSV output, set OUTPUT_CSV to True to enable.")
 
