@@ -595,8 +595,6 @@ class OptimizedModel:
         )
         tune_folds = _compute_q_folds(tscv_tune)
 
-        STD_PENALTY = 0.2
-
         def _compute_cv_mean_std(xgb_params):
             fold_scores = []
 
@@ -625,11 +623,10 @@ class OptimizedModel:
             "device": self.training_device,
             "max_bin": MAX_BINS,
             "random_state": 42,
-            "eval_metric": "mae",  # ["rmse", "mae"]
+            "eval_metric": "rmse",  # ["rmse", "mae"]
         }
 
-        BEST_XGB_PARAMS_GUESS = {
-            **BASE_XGB_PARAMS,
+        BEST_SEARCH_PARAMS_GUESS = {
             "learning_rate": 0.02,
             "subsample": 0.6,
             "colsample_bytree": 0.8,
@@ -642,7 +639,6 @@ class OptimizedModel:
         }
 
         search_space = {
-            **BASE_XGB_PARAMS,
             "learning_rate": hp.loguniform("learning_rate", np.log(1e-4), np.log(0.2)),
             "subsample": hp.uniform("subsample", 0.5, 1.0),
             "colsample_bytree": hp.uniform("colsample_bytree", 0.5, 1.0),
@@ -654,37 +650,41 @@ class OptimizedModel:
             "min_child_weight": hp.loguniform(
                 "min_child_weight", np.log(0.1), np.log(50)
             ),
-            "gamma": hp.loguniform("gamma", np.log(1e-2), np.log(10.0)),
+            "gamma": hp.loguniform("gamma", np.log(1e-2), np.log(6.0)),
             "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-3), np.log(100)),
             "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-5), np.log(0.5)),
         }
 
-        assert search_space.keys() == BEST_XGB_PARAMS_GUESS.keys()
+        def build_params(search_params):
+            return {**BASE_XGB_PARAMS, **search_params}
 
-        MAX_EVALS = 50
+        assert search_space.keys() == BEST_SEARCH_PARAMS_GUESS.keys()
+
+        MAX_EVALS = 40
         print(f"Begin Hyperparameter Tuning: MAX_EVALS = {MAX_EVALS}")
 
-        trials = generate_trials_to_calculate([BEST_XGB_PARAMS_GUESS])
+        trials = generate_trials_to_calculate([BEST_SEARCH_PARAMS_GUESS])
 
-        def _objective(xgb_params):
+        def _objective(xgb_params, STD_PENALTY=0.2):
             print(f"Trial {len(trials.trials) + 1}")
+            xgb_params = build_params(xgb_params)
 
-            mean, std = _compute_cv_mean_std(xgb_params=xgb_params)
-            robust_score = mean - STD_PENALTY * std
+            wspear_mean, wspear_std = _compute_cv_mean_std(xgb_params=xgb_params)
+            wspear_robust_score = wspear_mean - STD_PENALTY * wspear_std
 
             print(
-                f"Trial {len(trials.trials) + 1} - mean: {mean:.4f}, std: {std:.4f}, robust_score: {robust_score:.4f}"
+                f"Trial {len(trials.trials) + 1} - mean: {wspear_mean:.4f}, std: {wspear_std:.4f}, robust_score: {wspear_robust_score:.4f}"
             )
 
             return {
-                "loss": -robust_score,
+                "loss": -wspear_robust_score,
                 "status": STATUS_OK,
-                "mean": mean,
-                "std": std,
-                "score": robust_score,
+                "mean": wspear_mean,
+                "std": wspear_std,
+                "score": wspear_robust_score,
             }
 
-        best_xgb_params = fmin(
+        best_hyper_params = fmin(
             fn=_objective,
             space=search_space,
             algo=tpe.suggest,
@@ -695,7 +695,7 @@ class OptimizedModel:
         best_trial = sorted(trials.results, key=lambda x: x["loss"])[0]
 
         print(
-            f"Best hyperopt CV weighted Spearman: {best_trial['score']:.4f} with params: {best_xgb_params}"
+            f"Best hyperopt CV weighted Spearman: {best_trial['score']:.4f} with params: {best_hyper_params}"
         )
 
         print(f"Retraining on full data with best hyperparameters...")
@@ -705,18 +705,19 @@ class OptimizedModel:
         )
         final_folds = _compute_q_folds(tscv_final)
 
-        #
-        best_xgb_params = {
-            **best_xgb_params,
-            "max_leaves": int(best_xgb_params["max_leaves"]),
-        }
+        best_hyper_params = build_params(
+            {
+                **best_hyper_params,
+                "max_leaves": int(best_hyper_params["max_leaves"]),
+            }
+        )
 
         best_model = None
         best_score = -np.inf
         final_scores = []
         for d_train, d_val, y_val in final_folds:  # type: ignore
             booster = xgb.train(
-                params=best_xgb_params,
+                params=best_hyper_params,
                 dtrain=d_train,
                 evals=[(d_train, "train"), (d_val, "val")],
                 num_boost_round=NUM_BOOST_ROUNDS,
@@ -730,15 +731,15 @@ class OptimizedModel:
             score = self.weighted_spearmanr(y_val, y_pred)
             print(f"w_spearmanr: {score}")
 
+            final_scores.append(score)
+
             if score > best_score:
                 best_score = score
                 best_model = booster
 
-            final_scores.append()
-
         final_scores = np.asarray(final_scores, dtype=np.float32)
         print(
-            f"6-fold mean={final_scores.mean():.4f} std={final_scores.std():.4f}  (params={best_xgb_params})"
+            f"{FINAL_N_SPLITS}-fold mean={final_scores.mean():.4f} std={final_scores.std():.4f}  (params={best_hyper_params})"
         )
 
         elapsed_time = time.monotonic() - t0
@@ -811,7 +812,7 @@ class OptimizedModel:
         if SAVE_MODEL:
             try:
                 os.makedirs(MODEL_DIR, exist_ok=True)  # keep saved models in a folder
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 full_path = os.path.join(MODEL_DIR, f"{timestamp}_{MODEL_FILE_NAME}")
 
                 print(f"Saving best model to {full_path}...")
@@ -820,7 +821,7 @@ class OptimizedModel:
             except Exception as e:
                 print(f"Error saving model: {e}")
 
-        OUTPUT_CSV = True
+        OUTPUT_CSV = False
 
         if OUTPUT_CSV:
             try:
@@ -908,7 +909,7 @@ class OptimizedModel:
         MAX_NUM_FEATURES = 30
 
         print("Plotting feature importance and SHAP summary...")
-        scores = [result["robust_score"] for result in trials.results]
+        scores = [result["score"] for result in trials.results]
         iters = np.arange(1, len(scores) + 1)
 
         plt.plot(iters, scores, marker="o")
