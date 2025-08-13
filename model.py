@@ -9,6 +9,13 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import shap  # type: ignore
+# from scipy.stats import spearmanr
+
+# from old_utils import process_cache 
+
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
+# pd.set_option("display_width", 1000)
 
 PROCESSING_DEVICE = "cpu"
 TRAIN_DEVICE = "cuda"
@@ -18,10 +25,23 @@ TRAIN_DATA_DIR = os.path.join(BASE_DIR, "kline_data", "train_data")
 TRAIN_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 SAMPLE_SUBMISSION_PATH = os.path.join(BASE_DIR, "sample_submission.csv")
 SUBMISSION_PATH = os.path.join(BASE_DIR, "submit.csv")
+RECENT_DATA_DIR = os.path.join(BASE_DIR, "2025_data")
+RECENT_DATA_CACHE_DIR = os.path.join(BASE_DIR, "2025_data_cache")
 
+
+# def get_timestamp_ranges(dfs):
+#     ranges = {}
+#     for name, df in dfs.items():
+#         # Ensure index is datetime
+#         idx = pd.to_datetime(df.index)
+#         if idx.min() != pd.Timestamp("2025-01-01 00:00:00") or idx.max() != pd.Timestamp("2025-07-01 02:15:00"):
+#             ranges[name] = (idx.min(), idx.max())
+#         else:
+#             continue
+#     return pd.DataFrame(ranges, index=["start", "end"]).T
 
 def compute_factors_torch(df, device):
-    # 转换为张量 convert to tensor
+    # 转换为张量 convert to tensor  
     close = torch.tensor(df["close_price"].values, dtype=torch.float32, device=device)
     volume = torch.tensor(df["volume"].values, dtype=torch.float32, device=device)
     amount = torch.tensor(df["amount"].values, dtype=torch.float32, device=device)
@@ -267,6 +287,7 @@ def get_single_symbol_kline_data(symbol, train_data_path, device):
     try:
         df = pd.read_parquet(f"{train_data_path}/{symbol}.parquet")
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        print(df.head().to_string())
         df = df.set_index("timestamp")
         df = df.astype(np.float64)
         required_cols = [
@@ -380,6 +401,7 @@ class OptimizedModel:
         "hour_cos",
         "dow_sin",
         "dow_cos",
+        # "adx",
     ]
 
     def __init__(self):
@@ -387,15 +409,17 @@ class OptimizedModel:
         self.sample_submission_path = SAMPLE_SUBMISSION_PATH
         self.submission_path = SUBMISSION_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
-        self.scaler = StandardScaler()
+        self.feature_scalers = {}  # Dictionary to store scalers for each feature
         self.processing_device = PROCESSING_DEVICE
         self.training_device = TRAIN_DEVICE
         self.cache_dir = TRAIN_CACHE_DIR
+        self.recent_train_data_path = RECENT_DATA_DIR
+        self.recent_cache_dir = RECENT_DATA_CACHE_DIR
         print(f"Using device: {self.processing_device}")
 
-    def get_all_symbol_list(self):
+    def get_all_symbol_list(self, train_data_path):
         try:
-            parquet_name_list = os.listdir(self.train_data_path)
+            parquet_name_list = os.listdir(train_data_path)
             symbol_list = [
                 parquet_name.split(".")[0] for parquet_name in parquet_name_list
             ]
@@ -404,13 +428,13 @@ class OptimizedModel:
             print(f"Error in get_all_symbol_list: {e}")
             return []
 
-    def get_all_symbol_kline(self):
+    def get_all_symbol_kline(self, train_data_path, start_datetime, end_datetime):
         t0 = time.monotonic()
 
         try:
             pool = mp.Pool(processes=PROCESSES)  # use multi core
 
-            all_symbol_list = self.get_all_symbol_list()
+            all_symbol_list = self.get_all_symbol_list(train_data_path)
             if not all_symbol_list:
                 print("No symbols found, exiting.")
                 pool.close()
@@ -419,7 +443,7 @@ class OptimizedModel:
             promise_list = [
                 pool.apply_async(
                     get_single_symbol_kline_data,
-                    (symbol, self.train_data_path, self.processing_device),
+                    (symbol, train_data_path, self.processing_device),
                 )
                 for symbol in all_symbol_list
             ]
@@ -436,6 +460,9 @@ class OptimizedModel:
                     print(f"{symbol} failed: empty or missing 'vwap'")
             failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
             print(f"Failed symbols: {failed_symbols}")
+            # df_dict = dict(zip(all_symbol_list, df_results))
+            # ranges = get_timestamp_ranges(df_dict)
+            # print(ranges)
 
         except KeyboardInterrupt:
             pool.terminate()
@@ -447,7 +474,7 @@ class OptimizedModel:
 
         # Clean data
         time_index = pd.date_range(
-            start=self.start_datetime, end="2024-12-31", freq="15min"
+            start=start_datetime, end=end_datetime, freq="15min"
         )  # 15 min time index
         df_open_price = pd.concat(
             [
@@ -495,9 +522,7 @@ class OptimizedModel:
     def weighted_spearmanr(self, y_true, y_pred):
         n = len(y_true)
         r_true = pd.Series(y_true).rank(ascending=False, method="average")
-        r_pred = pd.Series(y_pred, index=y_true.index).rank(
-            ascending=False, method="average"
-        )  # Only change
+        r_pred = pd.Series(y_pred).rank(ascending=False, method="average")
         x = 2 * (r_true - 1) / (n - 1) - 1
         w = x**2
         w_sum = w.sum()
@@ -507,15 +532,191 @@ class OptimizedModel:
         var_true = (w * (r_true - mu_true) ** 2).sum()
         var_pred = (w * (r_pred - mu_pred) ** 2).sum()
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
-
-    def train(self, df_target, factor_dfs):
+    
+    def scale_feature_dfs(self, feature_dfs, fit=True):
+        """
+        Apply StandardScaler to each feature DataFrame, scaling each symbol (column) independently.
+        Symbols with insufficient data across any feature will be dropped entirely for consistency.
+        For inference (fit=False), only symbols that have trained scalers will be kept.
+        
+        Args:
+            feature_dfs: Dictionary of feature DataFrames where each DataFrame has symbols as columns
+            fit: If True, fit the scalers. If False, use existing scalers for transform only.
+        
+        Returns:
+            tuple: (scaled_feature_dfs, symbols_to_keep)
+                - scaled_feature_dfs: Dictionary of scaled feature DataFrames
+                - symbols_to_keep: List of symbols that were kept after filtering
+        """
+        print(f"Scaling feature DataFrames by symbol, fit={fit}...")
+        
+        scaled_feature_dfs = {}
+        symbols_to_drop = set()
+        total_symbol_feature_pairs = 0
+        
+        if fit:
+            # First pass: identify symbols with insufficient data across any feature
+            print("Identifying symbols with insufficient data...")
+            for feature_name, df in feature_dfs.items():
+                for symbol in df.columns:
+                    total_symbol_feature_pairs += 1
+                    symbol_data = df[symbol].values.reshape(-1, 1)
+                    valid_mask = ~np.isnan(symbol_data.flatten())
+                    valid_count = valid_mask.sum()
+                    
+                    # Use a reasonable threshold for minimum data points
+                    min_data_points = max(10, len(symbol_data) // 100)  # At least 10 or 1% of data
+                    
+                    if valid_count < min_data_points:
+                        symbols_to_drop.add(symbol)
+            
+            if symbols_to_drop:
+                print(f"Symbols to be dropped due to insufficient data: {sorted(list(symbols_to_drop))}")
+                print(f"Number of symbols dropped: {len(symbols_to_drop)}")
+        else:
+            # For inference, identify symbols that don't have trained scalers
+            # Only use symbols that have scalers available from training
+            if not self.feature_scalers:
+                print("Warning: No trained scalers found!")
+                return feature_dfs
+            
+            # Get symbols that have scalers from any feature (should be consistent across all features)
+            trained_symbols = set()
+            for feature_name in feature_dfs.keys():
+                if feature_name in self.feature_scalers:
+                    trained_symbols.update(self.feature_scalers[feature_name].keys())
+            
+            # Find symbols in current dataset that don't have trained scalers
+            for feature_name, df in feature_dfs.items():
+                for symbol in df.columns:
+                    if symbol not in trained_symbols:
+                        symbols_to_drop.add(symbol)
+            
+            if symbols_to_drop:
+                print(f"Symbols to be dropped (no trained scalers): {sorted(list(symbols_to_drop))}")
+                print(f"Number of symbols dropped: {len(symbols_to_drop)}")
+        
+        for feature_name, df in feature_dfs.items():
+            print(f"Scaling feature: {feature_name}")
+            
+            # Drop symbols with insufficient data or missing scalers
+            symbols_to_keep = [col for col in df.columns if col not in symbols_to_drop]
+            df_filtered = df[symbols_to_keep].copy()
+            
+            if fit:
+                # Create a scaler for this feature if it doesn't exist
+                if feature_name not in self.feature_scalers:
+                    self.feature_scalers[feature_name] = {}
+                
+                # Scale each symbol (column) independently
+                scaled_df = df_filtered.copy()
+                
+                for symbol in df_filtered.columns:
+                    symbol_data = df_filtered[symbol].values.reshape(-1, 1)
+                    
+                    # Handle NaN values - only fit on valid data
+                    valid_mask = ~np.isnan(symbol_data.flatten())
+                    
+                    # Since we already filtered out symbols with insufficient data, 
+                    # we should always have enough data here
+                    if valid_mask.sum() > 1:
+                        # Create scaler for this feature-symbol combination
+                        scaler = StandardScaler()
+                        valid_data = symbol_data[valid_mask].reshape(-1, 1)
+                        scaler.fit(valid_data)
+                        
+                        # Store the scaler
+                        self.feature_scalers[feature_name][symbol] = scaler
+                        
+                        # Transform the data (NaN values will remain NaN)
+                        scaled_values = symbol_data.copy()
+                        scaled_values[valid_mask, 0] = scaler.transform(valid_data).flatten()
+                        scaled_df[symbol] = scaled_values.flatten()
+                    else:
+                        # This shouldn't happen after filtering, but just in case
+                        print(f"  Warning: Unexpected insufficient data for {feature_name}-{symbol}")
+                        self.feature_scalers[feature_name][symbol] = None
+                        
+            else:
+                # Transform only using existing scalers
+                scaled_df = df_filtered.copy()
+                if feature_name in self.feature_scalers:
+                    for symbol in df_filtered.columns:
+                        if symbol in self.feature_scalers[feature_name] and self.feature_scalers[feature_name][symbol] is not None:
+                            symbol_data = df_filtered[symbol].values.reshape(-1, 1)
+                            valid_mask = ~np.isnan(symbol_data.flatten())
+                            
+                            if valid_mask.sum() > 0:
+                                scaled_values = symbol_data.copy()
+                                valid_data = symbol_data[valid_mask].reshape(-1, 1)
+                                scaled_values[valid_mask, 0] = self.feature_scalers[feature_name][symbol].transform(valid_data).flatten()
+                                scaled_df[symbol] = scaled_values.flatten()
+                else:
+                    print(f"  Warning: No scalers found for feature {feature_name}, using original data")
+            
+            # Replace inf values and optionally fill NaN with 0
+            scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
+            # scaled_df = scaled_df.fillna(0)  # Uncomment if you want to fill NaN with 0
+            
+            scaled_feature_dfs[feature_name] = scaled_df
+        
+        if fit:
+            remaining_pairs = sum(len(df.columns) for df in scaled_feature_dfs.values())
+            dropped_pairs = total_symbol_feature_pairs - remaining_pairs
+            print(f"\nScaling Summary:")
+            print(f"  Original symbol-feature pairs: {total_symbol_feature_pairs}")
+            print(f"  Dropped symbol-feature pairs: {dropped_pairs}")
+            print(f"  Remaining symbol-feature pairs: {remaining_pairs}")
+            print(f"  Symbols retained: {len(symbols_to_keep) if 'symbols_to_keep' in locals() else 'N/A'}")
+        else:
+            remaining_pairs = sum(len(df.columns) for df in scaled_feature_dfs.values())
+            print(f"\nInference Scaling Summary:")
+            print(f"  Symbols retained for inference: {len(symbols_to_keep) if 'symbols_to_keep' in locals() else 'N/A'}")
+            print(f"  Symbol-feature pairs for inference: {remaining_pairs}")
+        
+        # Return both the scaled DataFrames and the list of symbols that were kept
+        return scaled_feature_dfs, symbols_to_keep
+    
+    def filter_target_by_symbols(self, df_target, symbols_to_keep):
+        """
+        Filter target DataFrame to only include symbols that were kept after scaling.
+        
+        Args:
+            df_target: Target DataFrame with symbols as columns
+            symbols_to_keep: List of symbols to retain
+        
+        Returns:
+            Filtered target DataFrame
+        """
+        print(f"Filtering target DataFrame to match feature symbols...")
+        print(f"Original target shape: {df_target.shape}")
+        
+        # Only keep symbols that are both in the target and in the symbols_to_keep list
+        common_symbols = [symbol for symbol in symbols_to_keep if symbol in df_target.columns]
+        filtered_target = df_target[common_symbols].copy()
+        
+        print(f"Filtered target shape: {filtered_target.shape}")
+        print(f"Symbols retained in target: {len(common_symbols)}")
+        
+        if len(common_symbols) != len(symbols_to_keep):
+            missing_symbols = [symbol for symbol in symbols_to_keep if symbol not in df_target.columns]
+            print(f"Warning: {len(missing_symbols)} symbols from features not found in target: {missing_symbols[:10]}...")
+        
+        return filtered_target
+    
+    def prepare_data(self, df_target, factor_dfs):
         print("Preparing data for training...")
         t0 = time.monotonic()
-
+        print(f"Target shape: {df_target.shape}, Factor shapes: {[df.shape for df in factor_dfs.values()]}")   
+        print(f"Target memory usage: {df_target.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
+        total_gb = sum(df.memory_usage(deep=True).sum() for df in factor_dfs.values()) / 1024**3
+        print(f"Total factor memory usage: {total_gb:.2f} GB")
         target_long = df_target.astype(np.float32).stack()
         target_long.name = "target"
 
         common_index = target_long.index
+        print(f"common index: {common_index}")
+        print(f"Common index length: {len(common_index)}")
 
         factor_long = []
         for ind, df in factor_dfs.items():
@@ -536,7 +737,12 @@ class OptimizedModel:
             ],
             axis=1,
         )
-
+        
+        factor_names = list(factor_dfs.keys())
+        X = data[factor_names]
+        y = data["target"].replace([np.inf, -np.inf], np.nan)
+        # X = X.loc[y.index]  # align X with y
+        
         elapsed_time = time.monotonic() - t0
         print(
             f"Data processing completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
@@ -548,11 +754,10 @@ class OptimizedModel:
         print(
             f"Index memory usage: {data.index.memory_usage(deep=True) / 1024**3:.2f} GB"
         )
-
-        factor_names = list(factor_dfs.keys())
-        X = data[factor_names]
-        y = data["target"].replace([np.inf, -np.inf], np.nan)
-
+        
+        return data, X, y
+    
+    def train(self, data, X, y, X_recent, y_recent):
         def make_weights(y_series):
             return np.where(
                 (y_series > y_series.quantile(0.93))
@@ -564,7 +769,7 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 64
+        MAX_BINS = 512
         GAP = 4 * 24 * 7  # 1 week gap
         TEST_SIZE = 4 * 24 * 365  # max training of 1 year data
         NUM_BOOST_ROUNDS = 1500
@@ -572,12 +777,12 @@ class OptimizedModel:
 
         XGB_PARAMS = {
             "objective": "reg:pseudohubererror",
-            "learning_rate": 0.02,
-            # "max_depth": 8,
-            "subsample": 0.6,
+            "learning_rate": 0.01,
+            "max_depth": 12,
+            "subsample": 0.8,
             "grow_policy": "lossguide",
             "max_leaves": 64,  # start 32–128
-            "min_child_weight": 6,
+            "min_child_weight": 8,
             "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
             "reg_lambda": 2.0,  # penalizes large leaf weights
             "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
@@ -591,6 +796,9 @@ class OptimizedModel:
         }
 
         times = X.index.get_level_values(0).to_numpy()
+        X_scaled = X.values.astype(np.float32)  # Features are already scaled before prepare_data
+        # Handle any remaining NaN values
+        X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
         uniq_times = np.unique(times)
         tscv = TimeSeriesSplit(n_splits=6, gap=GAP, test_size=TEST_SIZE)
         best_score = -np.inf
@@ -606,14 +814,14 @@ class OptimizedModel:
             train_mask = np.isin(times, train_times)
             val_mask = np.isin(times, val_times)
 
-            X_train, X_val = X[train_mask], X[val_mask]
+            X_train, X_val = X_scaled[train_mask], X_scaled[val_mask]
             y_train, y_val = y[train_mask], y[val_mask]
             w_train = make_weights(y_train)
 
             d_train = xgb.QuantileDMatrix(
                 X_train, y_train, weight=w_train, max_bin=MAX_BINS
             )
-            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
+            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS, ref = d_train)
 
             model = xgb.train(
                 params=XGB_PARAMS,
@@ -628,7 +836,7 @@ class OptimizedModel:
                 d_val,
                 iteration_range=(0, model.best_iteration + 1),
             )
-            score = self.weighted_spearmanr(y_val, y_pred_val)
+            score = self.weighted_spearmanr(np.asarray(y_val), np.asarray(y_pred_val))
             print(f"Fold {fold} - Weighted Spearman correlation {score:.4f}")
             if score > best_score:
                 best_score = score
@@ -688,8 +896,33 @@ class OptimizedModel:
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
         data["y_pred"] = data["y_pred"].ewm(span=3).mean()
 
-        rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
+        rho_overall = self.weighted_spearmanr(np.asarray(data["target"]), np.asarray(data["y_pred"]))
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
+        
+        X_recent_scaled = X_recent.values.astype(np.float32)  # Features are already scaled before prepare_data
+        # Handle any remaining NaN values
+        X_recent_scaled = np.nan_to_num(X_recent_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        X_recent_dmatrix = xgb.DMatrix(X_recent_scaled)
+        prediction = best_model.predict(X_recent_dmatrix)
+        # print(np.min(prediction), np.max(prediction))
+        # print(np.unique(prediction[:100]))
+        
+        # print(type(prediction), type(y_recent))
+        # print(prediction.shape, y_recent.shape)
+        # print(np.min(prediction), np.max(prediction), np.unique(prediction[:10]))
+        # print(np.min(y_recent), np.max(y_recent), np.unique(y_recent[:10]))
+        prediction = pd.Series(prediction).replace([np.inf, -np.inf], 0).fillna(0).ewm(span=3).mean()
+        # print(type(prediction), type(y_recent))
+        recent_rho_overall = self.weighted_spearmanr(np.asarray(y_recent), np.asarray(prediction))
+        # print(y_recent.shape, prediction.shape)
+        # print(np.isnan(y_recent).sum(), np.isnan(prediction).sum())
+        # df = pd.DataFrame({'pred': np.asarray(prediction), 'target': np.asarray(y_recent)})
+        # print(df.corr(method='spearman'))
+        # rho, pval = spearmanr(np.asarray(prediction), np.asarray(y_recent))
+        # print(rho, pval)
+
+
+        print(f"Weighted Spearman correlation coefficient (recent): {recent_rho_overall:.4f}")
 
         SAVE_MODEL = True
         MODEL_DIR = "models"
@@ -813,20 +1046,15 @@ class OptimizedModel:
         )
         plt.show()
 
-    def run(self):
-        print("Train data directory contents:", os.listdir(self.train_data_path))
-
-        os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
-        print("Cache directory contents:", os.listdir(self.cache_dir))
-
+    def process_cache(self, train_data_path, cache_dir, start_datetime, end_datetime):
         # Separate cache files for raw and derived indicators
         RAW_CACHE_FILES = {
-            key: os.path.join(self.cache_dir, f"df_{key}.parquet")
+            key: os.path.join(cache_dir, f"df_{key}.parquet")
             for key in self.RAW_INDICATORS
         }
 
         DERIVED_CACHE_FILES = {
-            key: os.path.join(self.cache_dir, f"df_{key}.parquet")
+            key: os.path.join(cache_dir, f"df_{key}.parquet")
             for key in self.DERIVED_INDICATORS
         }
 
@@ -850,7 +1078,7 @@ class OptimizedModel:
 
         raw_dfs = {}
         if use_raw_cache:
-            print(f'Found raw indicator cache "{self.cache_dir}", using cached data.')
+            print(f'Found raw indicator cache "{cache_dir}", using cached data.')
 
             for ind in self.RAW_INDICATORS:
                 try:
@@ -864,10 +1092,14 @@ class OptimizedModel:
 
         if not use_raw_cache:
             print(
-                f'Cannot find all raw indicator cache files in "{self.cache_dir}", recalculating raw indicators.'
+                f'Cannot find all raw indicator cache files in "{cache_dir}", recalculating raw indicators.'
             )
 
-            (all_symbol_list, time_arr, raw_ind_arrays) = self.get_all_symbol_kline()
+            (all_symbol_list, time_arr, raw_ind_arrays) = self.get_all_symbol_kline(
+                train_data_path=train_data_path,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime
+            )
 
             if not all_symbol_list:
                 print("No data loaded, exiting.")
@@ -896,11 +1128,13 @@ class OptimizedModel:
         Z_SCORE_WINDOW = windows_1d  # 1 day if 15-min bars
 
         time_index = pd.date_range(
-            start=self.start_datetime, end="2024-12-31", freq="15min"
+            start=start_datetime, end=end_datetime, freq="15min"
         )
+        
+        # technically could change for the 2025 data but processing wise is purely symbolic
 
         if all_symbol_list is None:
-            all_symbol_list = self.get_all_symbol_list()
+            all_symbol_list = self.get_all_symbol_list(train_data_path=train_data_path)
             if not all_symbol_list:
                 print("No symbols found, exiting.")
                 return
@@ -912,7 +1146,7 @@ class OptimizedModel:
         derived_dfs = {}
         if use_derived_cache:
             print(
-                f'Found all derived indicators in cache "{self.cache_dir}", using cached data.'
+                f'Found all derived indicators in cache "{cache_dir}", using cached data.'
             )
 
             for ind in self.DERIVED_INDICATORS:
@@ -927,7 +1161,7 @@ class OptimizedModel:
 
         if not use_derived_cache:
             print(
-                f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
+                f'Cannot find derived indicator cache files in "{cache_dir}", recalculating derived indicators.'
             )
             # 1h_momentum
             derived_dfs["1h_momentum"] = (
@@ -989,6 +1223,21 @@ class OptimizedModel:
             derived_dfs["price_z"] = (
                 raw_dfs["close_price"] - price_rolling_mean
             ) / price_rolling_std.replace(0, np.nan)
+
+            # # adx
+            # high_low = raw_dfs["high_price"] - raw_dfs["low_price"]
+            # high_close = np.abs(raw_dfs["high_price"] - raw_dfs["close_price"].shift(1))
+            # low_close = np.abs(raw_dfs["low_price"] - raw_dfs["close_price"].shift(1))
+            # true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
+            # adx = pd.Series(dtype=float)
+            # for i in range(1, len(true_range)):
+            #     if i < 14:
+            #         adx[i] = np.nan
+            #     else:
+            #         adx[i] = (adx[i - 1] * 13 + true_range[i]) / 14
+
+            # derived_dfs["adx"] = adx
 
             # ultimate oscillator
             prev_close = raw_dfs["close_price"].shift(1)
@@ -1107,7 +1356,7 @@ class OptimizedModel:
             "rsi",
             "bb_upper",
             "bb_lower",
-            "bb_width",
+            # "bb_width",
             "bb_dev",
             # "keltner_upper",
             # "keltner_lower",
@@ -1131,160 +1380,193 @@ class OptimizedModel:
             "amount_sum",
             # "vol_norm_mom",
             "vol_momentum",
-            "squeeze_ratio",
+            # "squeeze_ratio",
             # "gk_vol",
             "24hour_rtn",
             "buy_ratio",
-            "hour_sin",
-            "hour_cos",
-            "dow_sin",
-            "dow_cos",
+            # "hour_sin",
+            # "hour_cos",
+            # "dow_sin",
+            # "dow_cos",
+            # "adx",
         ]
 
         feature_dfs = {
             **{key: raw_dfs[key] for key in raw_factors},
             **{key: derived_dfs[key] for key in derived_factors},
         }
+        
+        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
 
-        # ================
-        # External indicators
-        # ================
+        return raw_dfs,feature_dfs, df_target
+ 
 
-        # Add BTCUSDT and ETHUSDT for macro features
-        print("Adding BTCUSDT and ETHUSDT macro features...")
+    
+    def run(self):
+        print("Train data directory contents:", os.listdir(self.train_data_path))
 
-        market_syms = [
-            "BTCUSDT",
-            "ETHUSDT",
-        ]
-        # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
-        market_inds = [
-            "vwap_deviation",
-            "ult_osc",
-            "rsi",
-            # "vol_norm_mom",
-            # "1h_momentum",
-            # "4h_momentum",
-            "7d_momentum",
-        ]
+        os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
+        print("Cache directory contents:", os.listdir(self.cache_dir))
 
-        for factor in market_inds:
-            if factor not in feature_dfs:
-                print(f"Missing raw factor {factor}, cannot proceed.")
-                return
+        raw_dfs, feature_dfs, df_target = self.process_cache(self.train_data_path, self.cache_dir, self.start_datetime, "2024-12-31")
+        recent_raw_dfs, recent_feature_dfs, recent_df_target = self.process_cache(self.recent_train_data_path, self.recent_cache_dir, datetime.datetime(2025, 1, 1, 0, 0, 0), "2025-06-30")
 
-            for market_symbol in market_syms:
-                combined_col = None
+        # print(recent_df_target.max())
+        # recent_df_target = recent_df_target.clip(recent_df_target.quantile(0.05), recent_df_target.quantile(0.9), axis=1)
+        # print(recent_df_target.max())
+        
+        # # ================
+        # # External indicators
+        # # ================
+        # all_symbol_list = self.get_all_symbol_list(self.train_data_path)
+        # # Add BTCUSDT and ETHUSDT for macro features
+        # print("Adding BTCUSDT and ETHUSDT macro features...")
 
-                if market_symbol not in feature_dfs[factor].columns:
-                    print(
-                        f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
-                    )
-                    return
-                if combined_col is None:
-                    combined_col = feature_dfs[factor][market_symbol]
-                else:
-                    combined_col += feature_dfs[factor][market_symbol]
+        # market_syms = [
+        #     "BTCUSDT",
+        #     "ETHUSDT",
+        # ]
+        # # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
+        # market_inds = [
+        #     "vwap_deviation",
+        #     "ult_osc",
+        #     "rsi",
+        #     # "vol_norm_mom",
+        #     # "1h_momentum",
+        #     # "4h_momentum",
+        #     "7d_momentum",
+        # ]
 
-            feature_dfs[f"btc_eth_agg_{factor}"] = pd.DataFrame(
-                {
-                    symbol: combined_col if symbol not in market_syms else np.nan
-                    for symbol in all_symbol_list
-                },
-                index=feature_dfs[factor].index,
-            )
+        # for factor in market_inds:
+        #     if factor not in feature_dfs:
+        #         print(f"Missing raw factor {factor}, cannot proceed.")
+        #         return
 
-        # Calculate Beta
-        BETA_LOOKBACK_WINDOW = 90  # bars in your lookback, e.g. 90 day
-        BENCH_SYMBOL = "BTCUSDT"
+        #     for market_symbol in market_syms:
+        #         combined_col = None
 
-        rets = raw_dfs["close_price"].pct_change()
-        bench_ret = rets[BENCH_SYMBOL]
+        #         if market_symbol not in feature_dfs[factor].columns:
+        #             print(
+        #                 f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
+        #             )
+        #             return
+        #         if combined_col is None:
+        #             combined_col = feature_dfs[factor][market_symbol]
+        #         else:
+        #             combined_col += feature_dfs[factor][market_symbol]
 
-        rolling_var = bench_ret.rolling(
-            BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
-        ).var()
-        rolling_cov = rets.rolling(
-            BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
-        ).cov(bench_ret)
+        #     feature_dfs[f"btc_eth_agg_{factor}"] = pd.DataFrame(
+        #         {
+        #             symbol: combined_col 
+        #             for symbol in all_symbol_list
+        #         },
+        #         index=feature_dfs[factor].index,
+        #     )
 
-        beta_df = rolling_cov.div(rolling_var, axis=0)
+        # # Calculate Beta
+        # BETA_LOOKBACK_WINDOW = 90  # bars in your lookback, e.g. 90 day
+        # BENCH_SYMBOL = "BTCUSDT"
 
-        beta_z_df = beta_df.apply(
-            lambda col: (col - col.mean()) / col.std(ddof=0), axis=0
-        )
-        beta_z_df = beta_z_df.drop(columns=[BENCH_SYMBOL], errors="ignore")
-        feature_dfs["btc_beta_z"] = beta_z_df.ffill()
+        # rets = raw_dfs["close_price"].pct_change()
+        # bench_ret = rets[BENCH_SYMBOL]
 
-        # Add USDT features
-        print("Adding USDT to USD macro features...")
-        EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
+        # rolling_var = bench_ret.rolling(
+        #     BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
+        # ).var()
+        # rolling_cov = rets.rolling(
+        #     BETA_LOOKBACK_WINDOW, min_periods=BETA_LOOKBACK_WINDOW // 2
+        # ).cov(bench_ret)
 
-        try:
-            usdt_usd_df = get_single_symbol_kline_data(
-                "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
-            ).reindex(time_index, method="ffill")
+        # beta_df = rolling_cov.div(rolling_var, axis=0)
 
-            # USDT is a 1:1 peg to USD
-            usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
+        # beta_z_df = beta_df.apply(
+        #     lambda col: (col - col.mean()) / col.std(ddof=0), axis=0
+        # )
+        # beta_z_df = beta_z_df.drop(columns=[BENCH_SYMBOL], errors="ignore")
+        # feature_dfs["btc_beta_z"] = beta_z_df.ffill()
 
-            usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # usdt_usd_df["depeg"].fillna(0, inplace=True)
+        # # Add USDT features
+        # print("Adding USDT to USD macro features...")
+        # EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
 
-            # USDT is a 1:1 peg to USD
-            # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
-            # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        # try:
+        #     usdt_usd_df = get_single_symbol_kline_data(
+        #         "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
+        #     ).reindex(time_index, method="ffill")
 
-            # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
-            # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # USDT is a 1:1 peg to USD
+        #     usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
 
-            usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
-            usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
+        #     usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["depeg"].fillna(0, inplace=True)
 
-            usdt_usd_df["trade_intensity"] = (
-                (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
-                # .fillna(0)
-                .astype("float32")
-            )
+        #     # USDT is a 1:1 peg to USD
+        #     # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
+        #     # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-            # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
-            # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
+        #     # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
+        #     # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-            # # Step 3: Z-score (avoid div/0)
-            # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
-            #     depeg_rolling_std.replace(0, np.nan)
-            # )
+        #     usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
+        #     usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
 
-            USDT_FEATURES = [
-                # "vwap",
-                "depeg",
-                # "depeg_z",
-                # "depeg_low",
-                # "depeg_high",
-                "buy_ratio",
-                "trade_intensity",
-            ]
+        #     usdt_usd_df["trade_intensity"] = (
+        #         (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
+        #         # .fillna(0)
+        #         .astype("float32")
+        #     )
 
-            for feature in USDT_FEATURES:
-                feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
-                    {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
-                    index=usdt_usd_df[feature].index,
-                )
-        except Exception as e:
-            print(f"Error processing USDT_USD data: {e}, skipping")
-            raise
+        #     # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
+        #     # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
+
+        #     # # Step 3: Z-score (avoid div/0)
+        #     # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
+        #     #     depeg_rolling_std.replace(0, np.nan)
+        #     # )
+
+        #     USDT_FEATURES = [
+        #         # "vwap",
+        #         "depeg",
+        #         # "depeg_z",
+        #         # "depeg_low",
+        #         # "depeg_high",
+        #         "buy_ratio",
+        #         "trade_intensity",
+        #     ]
+
+        #     for feature in USDT_FEATURES:
+        #         feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
+        #             {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
+        #             index=usdt_usd_df[feature].index,
+        #         )
+        # except Exception as e:
+        #     print(f"Error processing USDT_USD data: {e}, skipping")
+        #     raise
 
         feature_keys = list(feature_dfs.keys())
 
         print("Finished loading factors")
-        print(f"Number of symbols: {len(all_symbol_list)}")
+        # print(f"Number of symbols: {len(all_symbol_list)}")
         print(f"Number of features: {len(feature_keys)}")
         print(f"Features: {feature_keys}")
 
-        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
+        # Scale features before preparing data
+        print("Scaling training features...")
+        scaled_feature_dfs, symbols_to_keep_train = self.scale_feature_dfs(feature_dfs, fit=True)
+        
+        print("Scaling recent features...")
+        scaled_recent_feature_dfs, symbols_to_keep_recent = self.scale_feature_dfs(recent_feature_dfs, fit=False)
 
-        self.train(df_target, feature_dfs)
+        # Filter targets to match the symbols kept in features
+        print("Filtering targets to match feature symbols...")
+        filtered_df_target = self.filter_target_by_symbols(df_target, symbols_to_keep_train)
+        filtered_recent_df_target = self.filter_target_by_symbols(recent_df_target, symbols_to_keep_recent)
+
+        data, X, y = self.prepare_data(filtered_df_target, scaled_feature_dfs)
+        data_recent, X_recent, y_recent = self.prepare_data(filtered_recent_df_target, scaled_recent_feature_dfs)
+
+        self.train(data, X, y, X_recent, y_recent)
 
 
 if __name__ == "__main__":
