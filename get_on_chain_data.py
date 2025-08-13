@@ -1,20 +1,22 @@
 """
-Multi-chain on-chain feature pipeline for 355 tokens
+Multi-chain on-chain feature pipeline for 313 tokens
 Targets: holder distribution, active addresses, large transactions, supply locked (TVL proxy)
-APIs used: CoinGecko (contract lookup), Moralis (token holders, token transfers), Bitquery (active addresses, large txs), DefiLlama (TVL)
+APIs used: CoinGecko (contract lookup), Etherscan/BSCscan/Polygonscan (free APIs), DefiLlama (TVL)
 
 Environment variables required:
 - COINGECKO: none (public)
-- MORALIS_API_KEY: Moralis Web3 API key
-- BITQUERY_API_KEY: Bitquery API key
+- ETHERSCAN_API_KEY: Etherscan API key (free tier available)
+- BSCSCAN_API_KEY: BSCscan API key (free tier available)  
+- POLYGONSCAN_API_KEY: Polygonscan API key (free tier available)
 
 Save output: parquet files per-token and a merged daily features parquet.
 
 Notes:
-- Designed to be robust for 300+ tokens. It maps symbol->contract (for EVM chains) with CoinGecko and falls back to chain-native handlers for non-EVM tokens.
-- Uses batching, caching, and simple exponential backoff for rate limits.
+- Designed to be robust for 313 tokens. Uses free APIs from blockchain explorers.
+- Maps symbol->contract with CoinGecko and gets on-chain data from respective chain scanners.
+- Uses caching and rate limiting for API calls.
 
-Run: python multi_chain_onchain_pipeline.py
+Run: python get_on_chain_data.py
 """
 
 import os
@@ -25,18 +27,37 @@ import requests
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 
 # config
 OUT_DIR = Path("onchain_features")
 OUT_DIR.mkdir(exist_ok=True)
 COINGECKO_API = "https://api.coingecko.com/api/v3"
-MORALIS_API = "https://deep-index.moralis.io/api/v2"
-BITQUERY_API = "https://streaming.bitquery.io/graphql"
-MORALIS_KEY = os.getenv("MORALIS_API_KEY")
-BITQUERY_KEY = os.getenv("BITQUERY_API_KEY")
 
-HEADERS_MORALIS = {"X-API-Key": MORALIS_KEY} if MORALIS_KEY else {}
-HEADERS_BITQUERY = {"X-API-KEY": BITQUERY_KEY} if BITQUERY_KEY else {}
+# Free blockchain explorer APIs
+ETHERSCAN_API = "https://api.etherscan.io/api"
+BSCSCAN_API = "https://api.bscscan.com/api"
+POLYGONSCAN_API = "https://api.polygonscan.com/api"
+DEFILLAMA_API = "https://api.llama.fi"
+
+# API Keys (free tier available)
+ETHERSCAN_KEY = os.getenv("ETHERSCAN_API_KEY", "YourApiKeyToken")  # Free tier: 5 calls/sec
+BSCSCAN_KEY = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")     # Free tier: 5 calls/sec
+POLYGONSCAN_KEY = os.getenv("POLYGONSCAN_API_KEY", "YourApiKeyToken")  # Free tier: 5 calls/sec
+
+# Headers for requests
+HEADERS = {"User-Agent": "OnChainDataPipeline/1.0"}
+
+# Excluded symbols (42 dropped tokens)
+EXCLUDED_SYMBOLS = {
+    'AI16ZUSDT', 'AIXBTUSDT', 'ALCHUSDT', 'ANIMEUSDT', 'ARCUSDT', 'AVAAIUSDT', 'AVAUSDT', 
+    'BIOUSDT', 'CGPTUSDT', 'COOKIEUSDT', 'DEGOUSDT', 'DEXEUSDT', 'DFUSDT', 'DUSDT', 
+    'FARTCOINUSDT', 'GRIFFAINUSDT', 'HIVEUSDT', 'KMNOUSDT', 'KOMAUSDT', 'LUMIAUSDT', 
+    'MELANIAUSDT', 'MEUSDT', 'MOCAUSDT', 'PENGUUSDT', 'PHAUSDT', 'PIPPINUSDT', 'PROMUSDT', 
+    'RAYSOLUSDT', 'SOLVUSDT', 'SONICUSDT', 'SPXUSDT', 'SUSDT', 'SWARMSUSDT', 'TRUMPUSDT', 
+    'USUALUSDT', 'VANAUSDT', 'VELODROMEUSDT', 'VINEUSDT', 'VIRTUALUSDT', 'VTHOUSDT', 
+    'VVVUSDT', 'ZEREBROUSDT'
+}
 
 # utility helpers
 
@@ -75,77 +96,200 @@ def coingecko_map_symbols(symbols):
     return mapping
 
 
-# 2) Moralis token holders endpoint (EVM chains only) - returns top holders summary
-#    API: /token/{address}/holders
+# 2) Blockchain scanner APIs for token holders and transactions
+
+def get_explorer_api_url(chain):
+    """Get the appropriate blockchain explorer API URL and key"""
+    if chain == 'eth':
+        return ETHERSCAN_API, ETHERSCAN_KEY
+    elif chain == 'bsc':
+        return BSCSCAN_API, BSCSCAN_KEY
+    elif chain == 'polygon':
+        return POLYGONSCAN_API, POLYGONSCAN_KEY
+    else:
+        return ETHERSCAN_API, ETHERSCAN_KEY  # Default to Ethereum
+
+def get_token_holders_count(chain, contract_address):
+    """Get number of token holders using blockchain explorer APIs"""
+    try:
+        api_url, api_key = get_explorer_api_url(chain)
+        
+        # Get token info including holder count
+        params = {
+            'module': 'token',
+            'action': 'tokeninfo',
+            'contractaddress': contract_address,
+            'apikey': api_key
+        }
+        
+        def call():
+            r = requests.get(api_url, params=params, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        
+        response = retry_request(call)
+        
+        if response.get('status') == '1' and 'result' in response:
+            result = response['result'][0] if isinstance(response['result'], list) else response['result']
+            return int(result.get('holdersCount', 0))
+        
+        return None
+    except Exception as e:
+        print(f"Failed to get holder count for {contract_address}: {e}")
+        return None
+
+def get_large_transactions(chain, contract_address, start_timestamp, end_timestamp, min_value=100000):
+    """Get large token transfers using blockchain explorer APIs"""
+    try:
+        api_url, api_key = get_explorer_api_url(chain)
+        
+        # Get token transfers
+        params = {
+            'module': 'account',
+            'action': 'tokentx',
+            'contractaddress': contract_address,
+            'startblock': 0,
+            'endblock': 99999999,
+            'sort': 'desc',
+            'apikey': api_key
+        }
+        
+        def call():
+            r = requests.get(api_url, params=params, headers=HEADERS, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        
+        response = retry_request(call)
+        
+        if response.get('status') == '1' and 'result' in response:
+            transfers = response['result']
+            large_txs = []
+            
+            for tx in transfers:
+                # Filter by timestamp and value
+                tx_timestamp = int(tx.get('timeStamp', 0))
+                if start_timestamp <= tx_timestamp <= end_timestamp:
+                    # Convert token value (considering decimals)
+                    decimals = int(tx.get('tokenDecimal', 18))
+                    value = float(tx.get('value', 0)) / (10 ** decimals)
+                    
+                    if value >= min_value:
+                        large_txs.append({
+                            'hash': tx.get('hash'),
+                            'timestamp': tx_timestamp,
+                            'value': value,
+                            'from': tx.get('from'),
+                            'to': tx.get('to')
+                        })
+            
+            return len(large_txs)
+        
+        return 0
+    except Exception as e:
+        print(f"Failed to get large transactions for {contract_address}: {e}")
+        return 0
+
+def get_active_addresses_count(chain, contract_address, start_timestamp, end_timestamp):
+    """Get count of unique active addresses for a token"""
+    try:
+        api_url, api_key = get_explorer_api_url(chain)
+        
+        # Get token transfers to count unique addresses
+        params = {
+            'module': 'account',
+            'action': 'tokentx',
+            'contractaddress': contract_address,
+            'startblock': 0,
+            'endblock': 99999999,
+            'sort': 'desc',
+            'apikey': api_key
+        }
+        
+        def call():
+            r = requests.get(api_url, params=params, headers=HEADERS, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        
+        response = retry_request(call)
+        
+        if response.get('status') == '1' and 'result' in response:
+            transfers = response['result']
+            unique_addresses = set()
+            
+            for tx in transfers:
+                tx_timestamp = int(tx.get('timeStamp', 0))
+                if start_timestamp <= tx_timestamp <= end_timestamp:
+                    unique_addresses.add(tx.get('from'))
+                    unique_addresses.add(tx.get('to'))
+            
+            return len(unique_addresses)
+        
+        return 0
+    except Exception as e:
+        print(f"Failed to get active addresses for {contract_address}: {e}")
+        return 0
+
+# 3) DefiLlama TVL data (free API)
+
+def get_defillama_tvl(protocol_slug):
+    """Get TVL data from DefiLlama (proxy for tokens locked)"""
+    try:
+        url = f"{DEFILLAMA_API}/protocol/{protocol_slug}"
+        
+        def call():
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        
+        response = retry_request(call)
+        
+        if 'tvl' in response:
+            # Get current TVL
+            tvl_data = response['tvl']
+            if tvl_data:
+                latest_tvl = tvl_data[-1].get('totalLiquidityUSD', 0) if tvl_data else 0
+                return latest_tvl
+        
+        return None
+    except Exception as e:
+        print(f"Failed to get TVL for {protocol_slug}: {e}")
+        return None
+
+def search_defillama_protocol(token_name):
+    """Search for protocol slug by token name"""
+    try:
+        url = f"{DEFILLAMA_API}/protocols"
+        
+        def call():
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        
+        protocols = retry_request(call)
+        
+        # Search for matching protocol
+        token_clean = token_name.lower().replace('usdt', '').replace('-', '').strip()
+        for protocol in protocols:
+            if token_clean in protocol.get('name', '').lower() or token_clean in protocol.get('symbol', '').lower():
+                return protocol.get('slug')
+        
+        return None
+    except Exception as e:
+        print(f"Failed to search DefiLlama for {token_name}: {e}")
+        return None
 
 
-def moralis_get_token_holders(chain, contract_address, cursor=None, limit=10000):
-    # chain examples: eth, bsc, polygon
-    url = f"{MORALIS_API}/erc20/{contract_address}/holders"
-    params = {"chain": chain}
-    if cursor:
-        params['cursor'] = cursor
-    def call():
-        r = requests.get(url, headers=HEADERS_MORALIS, params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    return retry_request(call)
-
-
-# 3) Bitquery graphql helper for active addresses and large txs (multi-chain)
-
-def bitquery_graphql(query, variables=None):
-    def call():
-        r = requests.post(BITQUERY_API, headers=HEADERS_BITQUERY, json={"query": query, "variables": variables}, timeout=60)
-        r.raise_for_status()
-        return r.json()
-    return retry_request(call)
-
-
-# Example Bitquery GQL templates
-BITQUERY_ACTIVE_ADDRS_Q = '''
-query ($network: String!, $from: ISO8601DateTime!, $to: ISO8601DateTime!, $currency: String!) {
-  transfers(
-    options: {limit: 10000}
-    date: {since: $from, till: $to}
-    exchange: {isExchange: null}
-    baseCurrency: {is: $currency}
-    network: $network
-  ) {
-    count
-    sender_count
-    receiver_count
-  }
-}
-'''
-
-BITQUERY_LARGE_TX_Q = '''
-query ($network: String!, $from: ISO8601DateTime!, $to: ISO8601DateTime!, $currency: String!, $minUsd: Float!) {
-  transfers(
-    date: {since: $from, till: $to}
-    network: $network
-    baseCurrency: {is: $currency}
-    amount: {gt: $minUsd}
-  ) {
-    edges { node { amount, transaction { hash } from { address } to { address } } }
-  }
-}
-'''
-
-# 4) DefiLlama TVL by protocol (proxy for tokens locked) - simple GET
-
-def defillama_tvl_slug(slug):
-    # public endpoints; not implemented fully here — placeholder
-    return None
-
-
-# 5) High-level per-token worker
+# 4) High-level per-token worker
 
 def process_token(symbol, coin_info, start_date='2021-01-01', end_date='2024-12-31'):
     """Produces a dataframe of daily features for the token and writes to OUT_DIR/{symbol}.parquet"""
     print(f"Processing {symbol}")
-    features = []
-
+    
+    # Skip excluded symbols
+    if symbol in EXCLUDED_SYMBOLS:
+        print(f"Skipping excluded symbol: {symbol}")
+        return None
+    
     # Determine chain & contract for EVM tokens
     contract = None
     chain = None
@@ -153,11 +297,11 @@ def process_token(symbol, coin_info, start_date='2021-01-01', end_date='2024-12-
         # prefer ethereum, binance-smart-chain, polygon
         platforms = coin_info.get('platforms')
         # common keys: 'ethereum', 'binance-smart-chain', 'polygon-pos'
-        for ckey in ['ethereum','binance-smart-chain','polygon-pos','arbitrum','optimistic-ethereum']:
+        for ckey in ['ethereum','binance-smart-chain','polygon-pos','arbitrum-one','optimistic-ethereum']:
             addr = platforms.get(ckey)
             if addr:
                 contract = addr
-                chain = 'eth' if ckey=='ethereum' else ('bsc' if 'binance' in ckey else 'polygon')
+                chain = 'eth' if ckey=='ethereum' else ('bsc' if 'binance' in ckey else ('polygon' if 'polygon' in ckey else 'eth'))
                 break
         # fallback to first non-empty
         if not contract:
@@ -167,81 +311,180 @@ def process_token(symbol, coin_info, start_date='2021-01-01', end_date='2024-12-
                     chain = 'eth'
                     break
 
-    # 1) Try CoinMetrics/CoinGecko for chain-native metrics (not implemented fully)
+    print(f"  Contract: {contract}, Chain: {chain}")
 
-    # 2) If EVM contract available: get top holders (Moralis), compute top-holder concentration
-    top_holder_pct = None
-    num_holders = None
-    if contract and MORALIS_KEY:
+    # Create date range
+    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+    df = pd.DataFrame({'date': date_range})
+    
+    # Initialize columns
+    df['symbol'] = symbol
+    df['contract_address'] = contract
+    df['chain'] = chain
+    df['num_holders'] = None
+    df['active_addresses'] = None
+    df['large_tx_count'] = None
+    df['tvl_usd'] = None
+
+    # 1) Get token holder count (current snapshot)
+    if contract and chain:
+        num_holders = get_token_holders_count(chain, contract)
+        df['num_holders'] = num_holders
+        print(f"  Holders: {num_holders}")
+        
+        # Add delay to respect rate limits
+        time.sleep(0.2)  # 5 requests per second limit
+    
+    # 2) Get on-chain activity metrics for recent period (last 30 days to avoid API limits)
+    if contract and chain:
         try:
-            resp = moralis_get_token_holders(chain or 'eth', contract)
-            # response contains 'total' and 'holders' list maybe depending on plan
-            # Example handling (best-effort):
-            total = resp.get('total')
-            holders = resp.get('result') or resp.get('holders') or []
-            num_holders = total or len(holders)
-            # compute top-1/top-10 share if holder rows exist
-            if holders:
-                # holder rows likely have 'balance' fields as string
-                bal_vals = [float(h.get('balance',0)) for h in holders[:10]]
-                top_holder_pct = sum(bal_vals)/sum(bal_vals) if sum(bal_vals)>0 else None
+            # Calculate timestamps for last 30 days
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=30)
+            start_timestamp = int(start_time.timestamp())
+            end_timestamp = int(end_time.timestamp())
+            
+            # Get active addresses count
+            active_addresses = get_active_addresses_count(chain, contract, start_timestamp, end_timestamp)
+            df.loc[df['date'] >= start_time.date(), 'active_addresses'] = active_addresses
+            print(f"  Active addresses (30d): {active_addresses}")
+            
+            time.sleep(0.2)  # Rate limit
+            
+            # Get large transactions count
+            large_tx_count = get_large_transactions(chain, contract, start_timestamp, end_timestamp)
+            df.loc[df['date'] >= start_time.date(), 'large_tx_count'] = large_tx_count
+            print(f"  Large transactions (30d): {large_tx_count}")
+            
+            time.sleep(0.2)  # Rate limit
+            
         except Exception as e:
-            print(f"Moralis holders failed for {symbol}: {e}")
+            print(f"  Error getting activity data: {e}")
 
-    # 3) Use Bitquery to pull daily active addresses & large tx counts
-    # Bitquery expects network names like 'ethereum', 'bsc', etc., and currency as token symbol or address
-    # We'll attempt a daily loop but for efficiency you'd batch multiple dates in production
+    # 3) Get TVL data from DefiLlama
     try:
-        query_vars = {
-            'network': 'ethereum' if chain=='eth' else ('bsc' if chain=='bsc' else 'ethereum'),
-            'from': start_date,
-            'to': end_date,
-            'currency': contract if contract else symbol
-        }
-        res = bitquery_graphql(BITQUERY_ACTIVE_ADDRS_Q, variables=query_vars)
-        # parse - this is API-dependent; here we show how you'd extract counts
-        # placeholder: create a daily df stub
-        df = pd.DataFrame({'date': pd.date_range(start=start_date, end=end_date),
-                           'active_addresses': None,
-                           'large_tx_count': None})
+        protocol_slug = search_defillama_protocol(symbol.replace('USDT', ''))
+        if protocol_slug:
+            tvl = get_defillama_tvl(protocol_slug)
+            df['tvl_usd'] = tvl
+            print(f"  TVL: ${tvl:,.0f}" if tvl else "  TVL: Not found")
+        time.sleep(0.1)  # Small delay for DefiLlama
     except Exception as e:
-        print(f"Bitquery failed for {symbol}: {e}")
-        df = pd.DataFrame({'date': pd.date_range(start=start_date, end=end_date)})
+        print(f"  Error getting TVL data: {e}")
 
-    # 4) Merge computed holder features to df
-    df['top_holder_pct'] = top_holder_pct
-    df['num_holders'] = num_holders
-
-    # Save
+    # Save to parquet
     out_file = OUT_DIR / f"{symbol}.parquet"
     df.to_parquet(out_file, index=False)
+    print(f"  Saved: {out_file}")
+    
     return out_file
 
 
-# 6) Orchestrator for list of tokens
+# 5) Orchestrator for list of tokens
 
-def run_for_symbols(symbols, max_workers=6):
-    mapping = coingecko_map_symbols(symbols)
+def run_for_symbols(symbols, max_workers=3):  # Reduced workers to respect API limits
+    """Process symbols with rate limiting and filtering"""
+    # Filter out excluded symbols
+    filtered_symbols = [sym for sym in symbols if sym not in EXCLUDED_SYMBOLS]
+    print(f"Processing {len(filtered_symbols)} symbols (excluded {len(symbols) - len(filtered_symbols)})")
+    
+    mapping = coingecko_map_symbols(filtered_symbols)
     results = []
+    
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(process_token, sym, mapping.get(sym)): sym for sym in symbols}
+        futures = {ex.submit(process_token, sym, mapping.get(sym)): sym for sym in filtered_symbols}
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
                 out = fut.result()
-                print(f"Finished {sym} -> {out}")
-                results.append(out)
+                if out:  # Skip None results from excluded symbols
+                    print(f"✓ Finished {sym} -> {out}")
+                    results.append(out)
             except Exception as e:
-                print(f"Failed {sym}: {e}")
+                print(f"✗ Failed {sym}: {e}")
+    
     return results
+
+def create_merged_dataset():
+    """Merge all individual token parquet files into one dataset"""
+    parquet_files = list(OUT_DIR.glob("*.parquet"))
+    if not parquet_files:
+        print("No parquet files found to merge")
+        return
+    
+    print(f"Merging {len(parquet_files)} token datasets...")
+    
+    dfs = []
+    for file in parquet_files:
+        try:
+            df = pd.read_parquet(file)
+            dfs.append(df)
+        except Exception as e:
+            print(f"Error reading {file}: {e}")
+    
+    if dfs:
+        merged_df = pd.concat(dfs, ignore_index=True)
+        merged_file = OUT_DIR / "merged_onchain_features.parquet"
+        merged_df.to_parquet(merged_file, index=False)
+        print(f"Saved merged dataset: {merged_file}")
+        print(f"Dataset shape: {merged_df.shape}")
+        print(f"Symbols covered: {merged_df['symbol'].nunique()}")
+    else:
+        print("No data to merge")
 
 
 # Example usage
 if __name__ == '__main__':
-    # Automatically list all symbols from kline_data/train_data
+    print("🚀 Starting on-chain data collection for 313 tokens...")
+    print(f"📂 Output directory: {OUT_DIR}")
+    print(f"🚫 Excluding {len(EXCLUDED_SYMBOLS)} symbols")
+    
+    # Check for data directory
     TRAIN_DATA_DIR = Path("kline_data/train_data")
+    if not TRAIN_DATA_DIR.exists():
+        TRAIN_DATA_DIR = Path("kline_data")  # fallback
+    
+    if not TRAIN_DATA_DIR.exists():
+        print("❌ kline_data directory not found!")
+        exit(1)
+    
+    # Get symbols from parquet files
     symbol_files = list(TRAIN_DATA_DIR.glob("*.parquet"))
+    if not symbol_files:
+        # Check for CSV files as fallback
+        symbol_files = list(TRAIN_DATA_DIR.glob("*.csv"))
+    
     symbols = [f.stem for f in symbol_files]
-    print(f"Found {len(symbols)} symbols.")
-    run_for_symbols(symbols)
-    print("Done. Parquets are in", OUT_DIR)
+    print(f"📊 Found {len(symbols)} total symbols")
+    
+    if not symbols:
+        print("❌ No symbol files found!")
+        exit(1)
+    
+    # Check API keys
+    if ETHERSCAN_KEY == "YourApiKeyToken":
+        print("⚠️  Using default Etherscan API key - get a free key at https://etherscan.io/apis")
+    if BSCSCAN_KEY == "YourApiKeyToken":
+        print("⚠️  Using default BSCScan API key - get a free key at https://bscscan.com/apis")
+    if POLYGONSCAN_KEY == "YourApiKeyToken":
+        print("⚠️  Using default PolygonScan API key - get a free key at https://polygonscan.com/apis")
+    
+    # Run the pipeline
+    start_time = time.time()
+    results = run_for_symbols(symbols)
+    
+    # Create merged dataset
+    create_merged_dataset()
+    
+    elapsed = time.time() - start_time
+    print(f"✅ Done in {elapsed:.1f}s! Processed {len(results)} tokens.")
+    print(f"📁 Output files in: {OUT_DIR}")
+    
+    # Summary stats
+    if results:
+        print(f"\n📈 Summary:")
+        print(f"   - Individual files: {len(results)}")
+        print(f"   - Total symbols requested: {len(symbols)}")
+        print(f"   - Successfully processed: {len(results)}")
+        print(f"   - Failed/Excluded: {len(symbols) - len(results)}")
+        print(f"   - Output directory: {OUT_DIR.absolute()}")

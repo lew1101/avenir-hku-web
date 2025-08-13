@@ -409,7 +409,7 @@ class OptimizedModel:
         self.sample_submission_path = SAMPLE_SUBMISSION_PATH
         self.submission_path = SUBMISSION_PATH
         self.start_datetime = datetime.datetime(2021, 3, 1, 0, 0, 0)
-        self.scaler = StandardScaler()
+        self.feature_scalers = {}  # Dictionary to store scalers for each feature
         self.processing_device = PROCESSING_DEVICE
         self.training_device = TRAIN_DEVICE
         self.cache_dir = TRAIN_CACHE_DIR
@@ -522,9 +522,7 @@ class OptimizedModel:
     def weighted_spearmanr(self, y_true, y_pred):
         n = len(y_true)
         r_true = pd.Series(y_true).rank(ascending=False, method="average")
-        r_pred = pd.Series(y_pred).rank(
-            ascending=False, method="average"
-        )  # Only change
+        r_pred = pd.Series(y_pred).rank(ascending=False, method="average")
         x = 2 * (r_true - 1) / (n - 1) - 1
         w = x**2
         w_sum = w.sum()
@@ -534,7 +532,178 @@ class OptimizedModel:
         var_true = (w * (r_true - mu_true) ** 2).sum()
         var_pred = (w * (r_pred - mu_pred) ** 2).sum()
         return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
-
+    
+    def scale_feature_dfs(self, feature_dfs, fit=True):
+        """
+        Apply StandardScaler to each feature DataFrame, scaling each symbol (column) independently.
+        Symbols with insufficient data across any feature will be dropped entirely for consistency.
+        For inference (fit=False), only symbols that have trained scalers will be kept.
+        
+        Args:
+            feature_dfs: Dictionary of feature DataFrames where each DataFrame has symbols as columns
+            fit: If True, fit the scalers. If False, use existing scalers for transform only.
+        
+        Returns:
+            tuple: (scaled_feature_dfs, symbols_to_keep)
+                - scaled_feature_dfs: Dictionary of scaled feature DataFrames
+                - symbols_to_keep: List of symbols that were kept after filtering
+        """
+        print(f"Scaling feature DataFrames by symbol, fit={fit}...")
+        
+        scaled_feature_dfs = {}
+        symbols_to_drop = set()
+        total_symbol_feature_pairs = 0
+        
+        if fit:
+            # First pass: identify symbols with insufficient data across any feature
+            print("Identifying symbols with insufficient data...")
+            for feature_name, df in feature_dfs.items():
+                for symbol in df.columns:
+                    total_symbol_feature_pairs += 1
+                    symbol_data = df[symbol].values.reshape(-1, 1)
+                    valid_mask = ~np.isnan(symbol_data.flatten())
+                    valid_count = valid_mask.sum()
+                    
+                    # Use a reasonable threshold for minimum data points
+                    min_data_points = max(10, len(symbol_data) // 100)  # At least 10 or 1% of data
+                    
+                    if valid_count < min_data_points:
+                        symbols_to_drop.add(symbol)
+            
+            if symbols_to_drop:
+                print(f"Symbols to be dropped due to insufficient data: {sorted(list(symbols_to_drop))}")
+                print(f"Number of symbols dropped: {len(symbols_to_drop)}")
+        else:
+            # For inference, identify symbols that don't have trained scalers
+            # Only use symbols that have scalers available from training
+            if not self.feature_scalers:
+                print("Warning: No trained scalers found!")
+                return feature_dfs
+            
+            # Get symbols that have scalers from any feature (should be consistent across all features)
+            trained_symbols = set()
+            for feature_name in feature_dfs.keys():
+                if feature_name in self.feature_scalers:
+                    trained_symbols.update(self.feature_scalers[feature_name].keys())
+            
+            # Find symbols in current dataset that don't have trained scalers
+            for feature_name, df in feature_dfs.items():
+                for symbol in df.columns:
+                    if symbol not in trained_symbols:
+                        symbols_to_drop.add(symbol)
+            
+            if symbols_to_drop:
+                print(f"Symbols to be dropped (no trained scalers): {sorted(list(symbols_to_drop))}")
+                print(f"Number of symbols dropped: {len(symbols_to_drop)}")
+        
+        for feature_name, df in feature_dfs.items():
+            print(f"Scaling feature: {feature_name}")
+            
+            # Drop symbols with insufficient data or missing scalers
+            symbols_to_keep = [col for col in df.columns if col not in symbols_to_drop]
+            df_filtered = df[symbols_to_keep].copy()
+            
+            if fit:
+                # Create a scaler for this feature if it doesn't exist
+                if feature_name not in self.feature_scalers:
+                    self.feature_scalers[feature_name] = {}
+                
+                # Scale each symbol (column) independently
+                scaled_df = df_filtered.copy()
+                
+                for symbol in df_filtered.columns:
+                    symbol_data = df_filtered[symbol].values.reshape(-1, 1)
+                    
+                    # Handle NaN values - only fit on valid data
+                    valid_mask = ~np.isnan(symbol_data.flatten())
+                    
+                    # Since we already filtered out symbols with insufficient data, 
+                    # we should always have enough data here
+                    if valid_mask.sum() > 1:
+                        # Create scaler for this feature-symbol combination
+                        scaler = StandardScaler()
+                        valid_data = symbol_data[valid_mask].reshape(-1, 1)
+                        scaler.fit(valid_data)
+                        
+                        # Store the scaler
+                        self.feature_scalers[feature_name][symbol] = scaler
+                        
+                        # Transform the data (NaN values will remain NaN)
+                        scaled_values = symbol_data.copy()
+                        scaled_values[valid_mask, 0] = scaler.transform(valid_data).flatten()
+                        scaled_df[symbol] = scaled_values.flatten()
+                    else:
+                        # This shouldn't happen after filtering, but just in case
+                        print(f"  Warning: Unexpected insufficient data for {feature_name}-{symbol}")
+                        self.feature_scalers[feature_name][symbol] = None
+                        
+            else:
+                # Transform only using existing scalers
+                scaled_df = df_filtered.copy()
+                if feature_name in self.feature_scalers:
+                    for symbol in df_filtered.columns:
+                        if symbol in self.feature_scalers[feature_name] and self.feature_scalers[feature_name][symbol] is not None:
+                            symbol_data = df_filtered[symbol].values.reshape(-1, 1)
+                            valid_mask = ~np.isnan(symbol_data.flatten())
+                            
+                            if valid_mask.sum() > 0:
+                                scaled_values = symbol_data.copy()
+                                valid_data = symbol_data[valid_mask].reshape(-1, 1)
+                                scaled_values[valid_mask, 0] = self.feature_scalers[feature_name][symbol].transform(valid_data).flatten()
+                                scaled_df[symbol] = scaled_values.flatten()
+                else:
+                    print(f"  Warning: No scalers found for feature {feature_name}, using original data")
+            
+            # Replace inf values and optionally fill NaN with 0
+            scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
+            # scaled_df = scaled_df.fillna(0)  # Uncomment if you want to fill NaN with 0
+            
+            scaled_feature_dfs[feature_name] = scaled_df
+        
+        if fit:
+            remaining_pairs = sum(len(df.columns) for df in scaled_feature_dfs.values())
+            dropped_pairs = total_symbol_feature_pairs - remaining_pairs
+            print(f"\nScaling Summary:")
+            print(f"  Original symbol-feature pairs: {total_symbol_feature_pairs}")
+            print(f"  Dropped symbol-feature pairs: {dropped_pairs}")
+            print(f"  Remaining symbol-feature pairs: {remaining_pairs}")
+            print(f"  Symbols retained: {len(symbols_to_keep) if 'symbols_to_keep' in locals() else 'N/A'}")
+        else:
+            remaining_pairs = sum(len(df.columns) for df in scaled_feature_dfs.values())
+            print(f"\nInference Scaling Summary:")
+            print(f"  Symbols retained for inference: {len(symbols_to_keep) if 'symbols_to_keep' in locals() else 'N/A'}")
+            print(f"  Symbol-feature pairs for inference: {remaining_pairs}")
+        
+        # Return both the scaled DataFrames and the list of symbols that were kept
+        return scaled_feature_dfs, symbols_to_keep
+    
+    def filter_target_by_symbols(self, df_target, symbols_to_keep):
+        """
+        Filter target DataFrame to only include symbols that were kept after scaling.
+        
+        Args:
+            df_target: Target DataFrame with symbols as columns
+            symbols_to_keep: List of symbols to retain
+        
+        Returns:
+            Filtered target DataFrame
+        """
+        print(f"Filtering target DataFrame to match feature symbols...")
+        print(f"Original target shape: {df_target.shape}")
+        
+        # Only keep symbols that are both in the target and in the symbols_to_keep list
+        common_symbols = [symbol for symbol in symbols_to_keep if symbol in df_target.columns]
+        filtered_target = df_target[common_symbols].copy()
+        
+        print(f"Filtered target shape: {filtered_target.shape}")
+        print(f"Symbols retained in target: {len(common_symbols)}")
+        
+        if len(common_symbols) != len(symbols_to_keep):
+            missing_symbols = [symbol for symbol in symbols_to_keep if symbol not in df_target.columns]
+            print(f"Warning: {len(missing_symbols)} symbols from features not found in target: {missing_symbols[:10]}...")
+        
+        return filtered_target
+    
     def prepare_data(self, df_target, factor_dfs):
         print("Preparing data for training...")
         t0 = time.monotonic()
@@ -627,7 +796,9 @@ class OptimizedModel:
         }
 
         times = X.index.get_level_values(0).to_numpy()
-        X_scaled = self.scaler.fit_transform(X)
+        X_scaled = X.values.astype(np.float32)  # Features are already scaled before prepare_data
+        # Handle any remaining NaN values
+        X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
         uniq_times = np.unique(times)
         tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=MAX_TRAIN_SIZE)
         best_score = -np.inf
@@ -728,7 +899,9 @@ class OptimizedModel:
         rho_overall = self.weighted_spearmanr(np.asarray(data["target"]), np.asarray(data["y_pred"]))
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
         
-        X_recent_scaled = self.scaler.fit_transform(X_recent)
+        X_recent_scaled = X_recent.values.astype(np.float32)  # Features are already scaled before prepare_data
+        # Handle any remaining NaN values
+        X_recent_scaled = np.nan_to_num(X_recent_scaled, nan=0.0, posinf=0.0, neginf=0.0)
         X_recent_dmatrix = xgb.DMatrix(X_recent_scaled)
         prediction = best_model.predict(X_recent_dmatrix)
         # print(np.min(prediction), np.max(prediction))
@@ -1200,9 +1373,9 @@ class OptimizedModel:
         raw_dfs, feature_dfs, df_target = self.process_cache(self.train_data_path, self.cache_dir, self.start_datetime, "2024-12-31")
         recent_raw_dfs, recent_feature_dfs, recent_df_target = self.process_cache(self.recent_train_data_path, self.recent_cache_dir, datetime.datetime(2025, 1, 1, 0, 0, 0), "2025-06-30")
 
-        print(recent_df_target.max())
-        recent_df_target = recent_df_target.clip(recent_df_target.quantile(0.05), recent_df_target.quantile(0.9), axis=1)
-        print(recent_df_target.max())
+        # print(recent_df_target.max())
+        # recent_df_target = recent_df_target.clip(recent_df_target.quantile(0.05), recent_df_target.quantile(0.9), axis=1)
+        # print(recent_df_target.max())
         
         # # ================
         # # External indicators
@@ -1340,10 +1513,20 @@ class OptimizedModel:
         print(f"Number of features: {len(feature_keys)}")
         print(f"Features: {feature_keys}")
 
+        # Scale features before preparing data
+        print("Scaling training features...")
+        scaled_feature_dfs, symbols_to_keep_train = self.scale_feature_dfs(feature_dfs, fit=True)
         
+        print("Scaling recent features...")
+        scaled_recent_feature_dfs, symbols_to_keep_recent = self.scale_feature_dfs(recent_feature_dfs, fit=False)
 
-        data, X, y = self.prepare_data(df_target, feature_dfs)
-        data_recent, X_recent, y_recent = self.prepare_data(recent_df_target, recent_feature_dfs)
+        # Filter targets to match the symbols kept in features
+        print("Filtering targets to match feature symbols...")
+        filtered_df_target = self.filter_target_by_symbols(df_target, symbols_to_keep_train)
+        filtered_recent_df_target = self.filter_target_by_symbols(recent_df_target, symbols_to_keep_recent)
+
+        data, X, y = self.prepare_data(filtered_df_target, scaled_feature_dfs)
+        data_recent, X_recent, y_recent = self.prepare_data(filtered_recent_df_target, scaled_recent_feature_dfs)
 
         self.train(data, X, y, X_recent, y_recent)
 
