@@ -31,7 +31,7 @@ OUT_DIR = Path("onchain_features")
 OUT_DIR.mkdir(exist_ok=True)
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 MORALIS_API = "https://deep-index.moralis.io/api/v2"
-BITQUERY_API = "https://graphql.bitquery.io/"
+BITQUERY_API = "https://streaming.bitquery.io/graphql"
 MORALIS_KEY = os.getenv("MORALIS_API_KEY")
 BITQUERY_KEY = os.getenv("BITQUERY_API_KEY")
 
@@ -141,7 +141,7 @@ def defillama_tvl_slug(slug):
 
 # 5) High-level per-token worker
 
-def process_token(symbol, coin_info, start_date='2021-03-01', end_date='2024-12-31'):
+def process_token(symbol, coin_info, start_date='2021-01-01', end_date='2024-12-31'):
     """Produces a dataframe of daily features for the token and writes to OUT_DIR/{symbol}.parquet"""
     print(f"Processing {symbol}")
     features = []
@@ -238,8 +238,10 @@ def run_for_symbols(symbols, max_workers=6):
 
 # Example usage
 if __name__ == '__main__':
-    # Example small set - replace with your 355 list
-    sample = ['BTCUSDT','ETHUSDT','DOGEUSDT','PEPEUSDT']
-    run_for_symbols(sample)
-
+    # Automatically list all symbols from kline_data/train_data
+    TRAIN_DATA_DIR = Path("kline_data/train_data")
+    symbol_files = list(TRAIN_DATA_DIR.glob("*.parquet"))
+    symbols = [f.stem for f in symbol_files]
+    print(f"Found {len(symbols)} symbols.")
+    run_for_symbols(symbols)
     print("Done. Parquets are in", OUT_DIR)

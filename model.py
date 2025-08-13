@@ -9,7 +9,13 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 from sklearn.model_selection import TimeSeriesSplit  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import shap  # type: ignore
-from old_utils import process_cache 
+# from scipy.stats import spearmanr
+
+# from old_utils import process_cache 
+
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
+# pd.set_option("display_width", 1000)
 
 PROCESSING_DEVICE = "cpu"
 TRAIN_DEVICE = "cuda"
@@ -23,8 +29,19 @@ RECENT_DATA_DIR = os.path.join(BASE_DIR, "2025_data")
 RECENT_DATA_CACHE_DIR = os.path.join(BASE_DIR, "2025_data_cache")
 
 
+# def get_timestamp_ranges(dfs):
+#     ranges = {}
+#     for name, df in dfs.items():
+#         # Ensure index is datetime
+#         idx = pd.to_datetime(df.index)
+#         if idx.min() != pd.Timestamp("2025-01-01 00:00:00") or idx.max() != pd.Timestamp("2025-07-01 02:15:00"):
+#             ranges[name] = (idx.min(), idx.max())
+#         else:
+#             continue
+#     return pd.DataFrame(ranges, index=["start", "end"]).T
+
 def compute_factors_torch(df, device):
-    # 转换为张量 convert to tensor
+    # 转换为张量 convert to tensor  
     close = torch.tensor(df["close_price"].values, dtype=torch.float32, device=device)
     volume = torch.tensor(df["volume"].values, dtype=torch.float32, device=device)
     amount = torch.tensor(df["amount"].values, dtype=torch.float32, device=device)
@@ -270,6 +287,7 @@ def get_single_symbol_kline_data(symbol, train_data_path, device):
     try:
         df = pd.read_parquet(f"{train_data_path}/{symbol}.parquet")
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        print(df.head().to_string())
         df = df.set_index("timestamp")
         df = df.astype(np.float64)
         required_cols = [
@@ -410,7 +428,7 @@ class OptimizedModel:
             print(f"Error in get_all_symbol_list: {e}")
             return []
 
-    def get_all_symbol_kline(self, train_data_path):
+    def get_all_symbol_kline(self, train_data_path, start_datetime, end_datetime):
         t0 = time.monotonic()
 
         try:
@@ -442,6 +460,9 @@ class OptimizedModel:
                     print(f"{symbol} failed: empty or missing 'vwap'")
             failed_symbols = [s for s in all_symbol_list if s not in loaded_symbols]
             print(f"Failed symbols: {failed_symbols}")
+            # df_dict = dict(zip(all_symbol_list, df_results))
+            # ranges = get_timestamp_ranges(df_dict)
+            # print(ranges)
 
         except KeyboardInterrupt:
             pool.terminate()
@@ -453,7 +474,7 @@ class OptimizedModel:
 
         # Clean data
         time_index = pd.date_range(
-            start=self.start_datetime, end="2024-12-31", freq="15min"
+            start=start_datetime, end=end_datetime, freq="15min"
         )  # 15 min time index
         df_open_price = pd.concat(
             [
@@ -501,7 +522,7 @@ class OptimizedModel:
     def weighted_spearmanr(self, y_true, y_pred):
         n = len(y_true)
         r_true = pd.Series(y_true).rank(ascending=False, method="average")
-        r_pred = pd.Series(y_pred, index=y_true.index).rank(
+        r_pred = pd.Series(y_pred).rank(
             ascending=False, method="average"
         )  # Only change
         x = 2 * (r_true - 1) / (n - 1) - 1
@@ -579,7 +600,7 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 256
+        MAX_BINS = 512
         GAP = 4 * 24 * 7  # 1 week gap
         MAX_TRAIN_SIZE = 4 * 24 * 365  # max training of 1 year data
         NUM_BOOST_ROUNDS = 1500
@@ -588,15 +609,15 @@ class OptimizedModel:
         XGB_PARAMS = {
             "objective": "reg:pseudohubererror",
             "learning_rate": 0.01,
-            # "max_depth": 8,
-            "subsample": 0.6,
+            "max_depth": 12,
+            "subsample": 0.8,
             "grow_policy": "lossguide",
             "max_leaves": 64,  # start 32–128
-            "min_child_weight": 6,
+            "min_child_weight": 8,
             "gamma": 0.1,  # Minimum loss reduction required to make a further split on a leaf
             "reg_lambda": 2.0,  # penalizes large leaf weights
             "reg_alpha": 0.01,  # penalizes the absolute value of leaf weights
-            "colsample_bytree": 0.7,
+            "colsample_bytree": 0.8,
             "colsample_bylevel": 0.8,
             "tree_method": "hist",
             "device": self.training_device,
@@ -644,7 +665,7 @@ class OptimizedModel:
                 d_val,
                 iteration_range=(0, model.best_iteration + 1),
             )
-            score = self.weighted_spearmanr(y_val, y_pred_val)
+            score = self.weighted_spearmanr(np.asarray(y_val), np.asarray(y_pred_val))
             print(f"Fold {fold} - Weighted Spearman correlation {score:.4f}")
             if score > best_score:
                 best_score = score
@@ -704,12 +725,30 @@ class OptimizedModel:
         data["y_pred"] = data["y_pred"].replace([np.inf, -np.inf], 0).fillna(0)
         data["y_pred"] = data["y_pred"].ewm(span=3).mean()
 
-        rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
+        rho_overall = self.weighted_spearmanr(np.asarray(data["target"]), np.asarray(data["y_pred"]))
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
         
         X_recent_scaled = self.scaler.fit_transform(X_recent)
-        prediction = best_model.predict(X_recent_scaled).replace([np.inf, -np.inf], 0).fillna(0).ewm(span=3).mean()
-        recent_rho_overall = self.weighted_spearmanr(y_recent, prediction)
+        X_recent_dmatrix = xgb.DMatrix(X_recent_scaled)
+        prediction = best_model.predict(X_recent_dmatrix)
+        # print(np.min(prediction), np.max(prediction))
+        # print(np.unique(prediction[:100]))
+        
+        # print(type(prediction), type(y_recent))
+        # print(prediction.shape, y_recent.shape)
+        # print(np.min(prediction), np.max(prediction), np.unique(prediction[:10]))
+        # print(np.min(y_recent), np.max(y_recent), np.unique(y_recent[:10]))
+        prediction = pd.Series(prediction).replace([np.inf, -np.inf], 0).fillna(0).ewm(span=3).mean()
+        # print(type(prediction), type(y_recent))
+        recent_rho_overall = self.weighted_spearmanr(np.asarray(y_recent), np.asarray(prediction))
+        # print(y_recent.shape, prediction.shape)
+        # print(np.isnan(y_recent).sum(), np.isnan(prediction).sum())
+        # df = pd.DataFrame({'pred': np.asarray(prediction), 'target': np.asarray(y_recent)})
+        # print(df.corr(method='spearman'))
+        # rho, pval = spearmanr(np.asarray(prediction), np.asarray(y_recent))
+        # print(rho, pval)
+
+
         print(f"Weighted Spearman correlation coefficient (recent): {recent_rho_overall:.4f}")
 
         OUTPUT_CSV = False
@@ -796,7 +835,7 @@ class OptimizedModel:
         )
         plt.show()
 
-    def process_cache(self, train_data_path, cache_dir):
+    def process_cache(self, train_data_path, cache_dir, start_datetime, end_datetime):
         # Separate cache files for raw and derived indicators
         RAW_CACHE_FILES = {
             key: os.path.join(cache_dir, f"df_{key}.parquet")
@@ -845,7 +884,11 @@ class OptimizedModel:
                 f'Cannot find all raw indicator cache files in "{cache_dir}", recalculating raw indicators.'
             )
 
-            (all_symbol_list, time_arr, raw_ind_arrays) = self.get_all_symbol_kline(train_data_path=train_data_path)
+            (all_symbol_list, time_arr, raw_ind_arrays) = self.get_all_symbol_kline(
+                train_data_path=train_data_path,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime
+            )
 
             if not all_symbol_list:
                 print("No data loaded, exiting.")
@@ -874,7 +917,7 @@ class OptimizedModel:
         Z_SCORE_WINDOW = windows_1d  # 1 day if 15-min bars
 
         time_index = pd.date_range(
-            start=self.start_datetime, end="2024-12-31", freq="15min"
+            start=start_datetime, end=end_datetime, freq="15min"
         )
         
         # technically could change for the 2025 data but processing wise is purely symbolic
@@ -1130,10 +1173,10 @@ class OptimizedModel:
             # "gk_vol",
             "24hour_rtn",
             "buy_ratio",
-            "hour_sin",
-            "hour_cos",
-            "dow_sin",
-            "dow_cos",
+            # "hour_sin",
+            # "hour_cos",
+            # "dow_sin",
+            # "dow_cos",
             # "adx",
         ]
 
@@ -1144,21 +1187,27 @@ class OptimizedModel:
         
         df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
 
-        return feature_dfs, df_target
+        return raw_dfs,feature_dfs, df_target
+ 
 
+    
     def run(self):
         print("Train data directory contents:", os.listdir(self.train_data_path))
 
         os.makedirs(self.cache_dir, exist_ok=True)  # ensure cache directory exists
         print("Cache directory contents:", os.listdir(self.cache_dir))
 
-        feature_dfs, df_target = self.process_cache(self.train_data_path, self.cache_dir)
-        recent_feature_dfs, recent_df_target = self.process_cache(self.recent_train_data_path, self.recent_cache_dir)
+        raw_dfs, feature_dfs, df_target = self.process_cache(self.train_data_path, self.cache_dir, self.start_datetime, "2024-12-31")
+        recent_raw_dfs, recent_feature_dfs, recent_df_target = self.process_cache(self.recent_train_data_path, self.recent_cache_dir, datetime.datetime(2025, 1, 1, 0, 0, 0), "2025-06-30")
 
-        # ================
-        # External indicators
-        # ================
-
+        print(recent_df_target.max())
+        recent_df_target = recent_df_target.clip(recent_df_target.quantile(0.05), recent_df_target.quantile(0.9), axis=1)
+        print(recent_df_target.max())
+        
+        # # ================
+        # # External indicators
+        # # ================
+        # all_symbol_list = self.get_all_symbol_list(self.train_data_path)
         # # Add BTCUSDT and ETHUSDT for macro features
         # print("Adding BTCUSDT and ETHUSDT macro features...")
 
