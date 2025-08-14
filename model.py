@@ -286,14 +286,6 @@ def get_single_symbol_kline_data(symbol, train_data_path, device):
                 + ["vwap", "rsi", "macd", "buy_ratio", "vwap_deviation", "atr"]
             )
 
-        # smooth data by removing extreme outliers
-        df["close_price"] = df["close_price"].clip(
-            df["close_price"].quantile(0.01), df["close_price"].quantile(0.99)
-        )
-        df["volume"] = df["volume"].clip(
-            df["volume"].quantile(0.01), df["volume"].quantile(0.99)
-        )
-
         # Calculate the indicators
         df = compute_factors_torch(df, device)
         print(
@@ -366,12 +358,13 @@ class OptimizedModel:
         # "log_return_1h",
         # "log_return_4h",
         # "log_return_7d",
-        "price_z",
-        # "pct_change",
-        "volume_z",
-        "amount_sum",
+        "atr_pct",
+        "amount_7d_surge",
+        "amount_sum_7d",
         "vol_norm_mom",
         "vol_momentum",
+        "skew_24h_c",
+        "kurt_24h_c",
         "squeeze_ratio",
         "buy_ratio",
         "gk_vol",
@@ -447,7 +440,7 @@ class OptimizedModel:
 
         # Clean data
         time_index = pd.date_range(
-            start=self.start_datetime, end="2024-12-31", freq="15min"
+            start="2021-01-01 00:00:00", end="2024-12-31 23:45:00", freq="15min"
         )  # 15 min time index
         df_open_price = pd.concat(
             [
@@ -506,22 +499,25 @@ class OptimizedModel:
         cov = (w * (r_true - mu_true) * (r_pred - mu_pred)).sum()
         var_true = (w * (r_true - mu_true) ** 2).sum()
         var_pred = (w * (r_pred - mu_pred) ** 2).sum()
-        return cov / np.sqrt(var_true * var_pred) if var_true * var_pred > 0 else 0
+        return cov / np.sqrt(var_true * var_pred)
 
     def train(self, df_target, factor_dfs):
         print("Preparing data for training...")
         t0 = time.monotonic()
 
-        target_long = df_target.astype(np.float32).stack()
+        target_long = df_target.astype(np.float32).sort_index(ascending=True).stack()
         target_long.name = "target"
 
         common_index = target_long.index
+
+        assert not common_index.has_duplicates, "Duplicate index labels found!"
 
         factor_long = []
         for ind, df in factor_dfs.items():
             factor = (
                 df.astype(np.float32)
                 .replace([np.inf, -np.inf], np.nan)
+                .sort_index(ascending=True)
                 .stack()
                 .reindex(common_index)
             )
@@ -545,6 +541,12 @@ class OptimizedModel:
         print(
             f"Data memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
         )
+        print(f"Data shape before dropna: {data.shape}")
+        data = data.dropna(subset=["target"])
+        print(f"Data shape after dropna: {data.shape}")
+        print(
+            f"Data memory usage: {data.memory_usage(deep=True).sum() / 1024**3:.2f} GB"
+        )
         print(
             f"Index memory usage: {data.index.memory_usage(deep=True) / 1024**3:.2f} GB"
         )
@@ -555,8 +557,8 @@ class OptimizedModel:
 
         def make_weights(y_series):
             return np.where(
-                (y_series > y_series.quantile(0.93))
-                | (y_series < y_series.quantile(0.07)),
+                (y_series > y_series.quantile(0.95))
+                | (y_series < y_series.quantile(0.05)),
                 2.0,
                 1.0,
             ).astype(np.float32)
@@ -564,7 +566,7 @@ class OptimizedModel:
         print("Begin training model...")
         t0 = time.monotonic()
 
-        MAX_BINS = 64
+        MAX_BINS = 128
         GAP = 4 * 24 * 7  # 1 week gap
         TEST_SIZE = 4 * 24 * 365  # max training of 1 year data
         NUM_BOOST_ROUNDS = 1500
@@ -592,7 +594,7 @@ class OptimizedModel:
 
         times = X.index.get_level_values(0).to_numpy()
         uniq_times = np.unique(times)
-        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, test_size=TEST_SIZE)
+        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=TEST_SIZE)
         best_score = -np.inf
         best_model = None
 
@@ -613,7 +615,7 @@ class OptimizedModel:
             d_train = xgb.QuantileDMatrix(
                 X_train, y_train, weight=w_train, max_bin=MAX_BINS
             )
-            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS)
+            d_val = xgb.QuantileDMatrix(X_val, y_val, max_bin=MAX_BINS, ref=d_train)
 
             model = xgb.train(
                 params=XGB_PARAMS,
@@ -693,7 +695,7 @@ class OptimizedModel:
 
         SAVE_MODEL = True
         MODEL_DIR = "models"
-        MODEL_FILE_NAME = "best_xgb_model.xgb"
+        MODEL_FILE_NAME = "best_xgb_model.json"
 
         if SAVE_MODEL:
             try:
@@ -707,7 +709,7 @@ class OptimizedModel:
             except Exception as e:
                 print(f"Error saving model: {e}")
 
-        OUTPUT_CSV = False
+        OUTPUT_CSV = True
 
         if OUTPUT_CSV:
             try:
@@ -718,72 +720,45 @@ class OptimizedModel:
                 df_submit["symbol"] = df_submit.index.values
                 df_submit = df_submit[["level_0", "symbol", "y_pred"]]
                 df_submit.columns = ["datetime", "symbol", "predict_return"]
-
                 df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
                 df_submit["id"] = (
-                    df_submit["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                    + "_"
-                    + df_submit["symbol"]
+                    df_submit["datetime"].astype(str) + "_" + df_submit["symbol"]
                 )
                 df_submit = df_submit[["id", "predict_return"]]
 
-                if os.path.exists(self.sample_submission_path):
-                    df_submission_id = pd.read_csv(self.sample_submission_path)
-                    # print("Submission ID sample:", df_submission_id.head())
-                    id_list = df_submission_id["id"].tolist()
-                    print(f"Submission ID count: {len(id_list)}")
-                    df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
-                    missing_elements = list(
-                        set(id_list) - set(df_submit_competion["id"])
-                    )
-                    print(f"Missing IDs: {len(missing_elements)}")
-                    new_rows = pd.DataFrame(
-                        {
-                            "id": missing_elements,
-                            "predict_return": [0] * len(missing_elements),
-                        }
-                    )
-                    df_submit_competion = pd.concat(
-                        [df_submit_competion, new_rows], ignore_index=True
-                    )
-                else:
-                    print(
-                        f"Warning: {self.sample_submission_path} not found. Saving submission without ID filtering."
-                    )
-                    df_submit_competion = df_submit
+                print(df_submit)
 
-                print("Submission file sample:", df_submit_competion.head())
-                df_submit_competion.to_csv(self.submission_path, index=False)
+                df_submission_id = pd.read_csv(self.sample_submission_path)
+                id_list = df_submission_id["id"].tolist()
+                df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
+                missing_elements = list(set(id_list) - set(df_submit_competion["id"]))
+                new_rows = pd.DataFrame(
+                    {
+                        "id": missing_elements,
+                        "predict_return": [0] * len(missing_elements),
+                    }
+                )
+                df_submit_competion = pd.concat(
+                    [df_submit, new_rows], ignore_index=True
+                )
+                print(df_submit_competion.shape)
+                df_submit_competion.to_csv("submit.csv", index=False)
 
-                SUBMISSION_FILE = "check.csv"
-                CHUNK_SIZE = 1_000_000
-                print(
-                    f"Saving data to {self.cache_dir} in chunks of {CHUNK_SIZE} rows..."
+                df_check = data.reset_index(level=0)
+                df_check = df_check[["level_0", "target"]]
+                df_check["symbol"] = df_check.index.values
+                df_check = df_check[["level_0", "symbol", "target"]]
+                df_check.columns = ["datetime", "symbol", "true_return"]
+                df_check = df_check[df_check["datetime"] >= self.start_datetime]
+                df_check["id"] = (
+                    df_check["datetime"].astype(str) + "_" + df_check["symbol"]
                 )
 
-                df_check = data.loc[self.start_datetime :]
-                with open(SUBMISSION_FILE, "w", newline="") as f:
-                    header_written = False
-                    n = len(df_check)
+                df_check = df_check[["id", "true_return"]]
 
-                    for start in range(0, n, CHUNK_SIZE):
-                        end = min(n, start + CHUNK_SIZE)
-                        chunk = df_check.iloc[start:end]
+                print(df_check)
 
-                        tmp_df = chunk.reset_index(level=0)[["level_0", "target"]]
-
-                        tmp_df["symbol"] = df_check.index.values
-                        tmp_df = tmp_df[["level_0", "symbol", "target"]]
-                        tmp_df.columns = ["datetime", "symbol", "true_return"]
-                        tmp_df["id"] = (
-                            tmp_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                            + "_"
-                            + tmp_df["symbol"]
-                        )
-                        out = tmp_df[["id", "true_return"]]
-                        out.to_csv(f, index=False, header=not header_written)
-
-                        header_written = True
+                df_check.to_csv("check.csv", index=False)
                 print("Finished saving to csv.")
 
             except Exception as e:
@@ -795,23 +770,44 @@ class OptimizedModel:
         MAX_NUM_FEATURES = 30
 
         print("Plotting feature importance and SHAP summary...")
-        xgb.plot_importance(
-            best_model,
-            importance_type="gain",
-            max_num_features=MAX_NUM_FEATURES,
-        )
-        plt.title("XGBoost Feature Importance (Gain)")
-        plt.tight_layout()
-        plt.show(block=False)
+        try:
+            # t = data["timestamp"][shap_slice]
+            # true_plt_y = data["target"][shap_slice]
+            # pred_plt_y = data["y_pred"][shap_slice]
 
-        plt.figure()
-        shap.summary_plot(
-            feature_shap,
-            features=X_for_shap,
-            feature_names=list(X.columns),
-            max_display=MAX_NUM_FEATURES,
-        )
-        plt.show()
+            # plt.figure(figsize=(10, 6))
+            # plt.scatter(t, true_plt_y, alpha=0.3, s=2)
+            # plt.scatter(t, pred_plt_y, alpha=0.3, s=2)
+            # plt.xlabel("True Target")
+            # plt.ylabel("Predicted Return")
+            # plt.title("Predicted vs True Target")
+            # plt.grid(True)
+            # plt.tight_layout()
+            # plt.gcf().autofmt_xdate()
+            # plt.show(block=False)
+
+            xgb.plot_importance(
+                best_model,
+                importance_type="gain",
+                max_num_features=MAX_NUM_FEATURES,
+            )
+            plt.title("XGBoost Feature Importance (Gain)")
+            plt.tight_layout()
+            plt.show(block=False)
+
+            plt.figure()
+            shap.summary_plot(
+                feature_shap,
+                features=X_for_shap,
+                feature_names=list(X.columns),
+                max_display=MAX_NUM_FEATURES,
+            )
+            plt.show()
+
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt, closing plots.")
+            plt.close("all")
+            return
 
     def run(self):
         print("Train data directory contents:", os.listdir(self.train_data_path))
@@ -844,6 +840,12 @@ class OptimizedModel:
             derived_indicator_cache_exists and raw_indicator_cache_exists
         )
 
+        def winsorize(df, lower_quantile=0.01, upper_quantile=0.99):
+            """Winsorize a DataFrame to limit extreme values."""
+            lower_bound = df.quantile(lower_quantile)
+            upper_bound = df.quantile(upper_quantile)
+            return df.clip(lower=lower_bound, upper=upper_bound, axis=1)
+
         # ================
         # Raw indicators
         # ================
@@ -852,13 +854,15 @@ class OptimizedModel:
         if use_raw_cache:
             print(f'Found raw indicator cache "{self.cache_dir}", using cached data.')
 
-            for ind in self.RAW_INDICATORS:
+            for feature in self.RAW_INDICATORS:
                 try:
-                    file = RAW_CACHE_FILES[ind]
-                    raw_dfs[ind] = pd.read_parquet(file)
-                    print(f"Loaded {ind} from cache, shape: {raw_dfs[ind].shape}")
+                    file = RAW_CACHE_FILES[feature]
+                    raw_dfs[feature] = pd.read_parquet(file)
+                    print(
+                        f"Loaded {feature} from cache, shape: {raw_dfs[feature].shape}"
+                    )
                 except Exception as e:
-                    print(f"Error loading {ind} from cache: {e}")
+                    print(f"Error loading {feature} from cache: {e}")
                     use_raw_cache = False
                     break
 
@@ -873,31 +877,32 @@ class OptimizedModel:
                 print("No data loaded, exiting.")
                 return
 
-            for ind in self.RAW_INDICATORS:
-                file = RAW_CACHE_FILES[ind]
-                print(f"Calculating {ind} indicators, saving to {file}")
-                arr = raw_ind_arrays[ind]
+            for feature in self.RAW_INDICATORS:
+                file = RAW_CACHE_FILES[feature]
+                print(f"Calculating {feature} indicators, saving to {file}")
+                arr = raw_ind_arrays[feature]
 
                 if arr is None or len(arr) == 0:
-                    print(f"No data for {ind}, skipping.")
+                    print(f"No data for {feature}, skipping.")
                     continue
 
-                raw_dfs[ind] = pd.DataFrame(
+                raw_dfs[feature] = pd.DataFrame(
                     arr, columns=all_symbol_list, index=time_arr
                 )
-                raw_dfs[ind].to_parquet(file)
-                print(f"Saved {ind} to cache, shape: {raw_dfs[ind].shape}")
+                raw_dfs[feature].to_parquet(file)
+                print(f"Saved {feature} to cache, shape: {raw_dfs[feature].shape}")
 
+        winsorize_raw = ["atr", "macd", "bb_width", "bb_dev", "cci", "obv"]
+        for feature in winsorize_raw:
+            if feature in raw_dfs:
+                print(f"Winsorizing {feature} indicator")
+                raw_dfs[feature] = winsorize(raw_dfs[feature])
+
+        windows_60d = 4 * 24 * 60
         windows_7d = 4 * 24 * 7
         windows_1d = 4 * 24 * 1
         windows_4h = 4 * 4
         windows_1h = 4
-
-        Z_SCORE_WINDOW = windows_1d  # 1 day if 15-min bars
-
-        time_index = pd.date_range(
-            start=self.start_datetime, end="2024-12-31", freq="15min"
-        )
 
         if all_symbol_list is None:
             all_symbol_list = self.get_all_symbol_list()
@@ -910,18 +915,23 @@ class OptimizedModel:
         # ================
 
         derived_dfs = {}
+
+        time_index = raw_dfs["open_price"].index
+
         if use_derived_cache:
             print(
                 f'Found all derived indicators in cache "{self.cache_dir}", using cached data.'
             )
 
-            for ind in self.DERIVED_INDICATORS:
+            for feature in self.DERIVED_INDICATORS:
                 try:
-                    file = DERIVED_CACHE_FILES[ind]
-                    derived_dfs[ind] = pd.read_parquet(file)
-                    print(f"Loaded {ind} from cache, shape: {derived_dfs[ind].shape}")
+                    file = DERIVED_CACHE_FILES[feature]
+                    derived_dfs[feature] = pd.read_parquet(file)
+                    print(
+                        f"Loaded {feature} from cache, shape: {derived_dfs[feature].shape}"
+                    )
                 except Exception as e:
-                    print(f"Error loading {ind} from cache: {e}")
+                    print(f"Error loading {feature} from cache: {e}")
                     use_raw_cache = False
                     break
 
@@ -930,24 +940,24 @@ class OptimizedModel:
                 f'Cannot find derived indicator cache files in "{self.cache_dir}", recalculating derived indicators.'
             )
             # 1h_momentum
-            derived_dfs["1h_momentum"] = (
-                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h) - 1
+            derived_dfs["1h_momentum"] = winsorize(
+                (raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1h).replace(0, np.nan))
+                - 1.0
             )
-            derived_dfs["1h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["1h_momentum"].fillna(0, inplace=True)
 
             # 4h_momentum
-            derived_dfs["4h_momentum"] = (
-                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h) - 1
+            derived_dfs["4h_momentum"] = winsorize(
+                (raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_4h).replace(0, np.nan))
+                - 1.0
             )
-            derived_dfs["4h_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["4h_momentum"].fillna(0, inplace=True)
 
             # 7d_momentum
-            derived_dfs["7d_momentum"] = (
-                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_7d) - 1
+            derived_dfs["7d_momentum"] = winsorize(
+                raw_dfs["vwap"] / (raw_dfs["vwap"].shift(windows_7d).replace(0, np.nan))
+                - 1.0
             )
-            derived_dfs["7d_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["7d_momentum"].fillna(0, inplace=True)
 
             # # lOG returns
@@ -975,21 +985,6 @@ class OptimizedModel:
             # )
             # derived_dfs["log_return_7d"].fillna(0, inplace=True)
 
-            volume_rolling_mean = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).mean()
-            volume_rolling_std = raw_dfs["volume"].rolling(Z_SCORE_WINDOW).std()
-
-            derived_dfs["volume_z"] = (raw_dfs["volume"] - volume_rolling_mean) / (
-                volume_rolling_std.replace(0, np.nan)
-            )
-
-            # price z-score
-            price_rolling_mean = raw_dfs["close_price"].rolling(Z_SCORE_WINDOW).mean()
-            price_rolling_std = raw_dfs["close_price"].rolling(Z_SCORE_WINDOW).std()
-
-            derived_dfs["price_z"] = (
-                raw_dfs["close_price"] - price_rolling_mean
-            ) / price_rolling_std.replace(0, np.nan)
-
             # ultimate oscillator
             prev_close = raw_dfs["close_price"].shift(1)
 
@@ -1002,9 +997,9 @@ class OptimizedModel:
 
             true_range.replace(0, np.nan, inplace=True)  # prevent div by 0
 
-            short_win = 7
-            med_win = 14
-            long_win = 28
+            short_win = 7 * 4
+            med_win = 14 * 4
+            long_win = 28 * 4
 
             bp1 = buy_pressure.rolling(short_win, min_periods=short_win).sum()
             tr1 = true_range.rolling(short_win, min_periods=short_win).sum()
@@ -1025,51 +1020,73 @@ class OptimizedModel:
             # # derived_dfs["pct_change"].fillna(0, inplace=True)
 
             # volume factor
-            derived_dfs["amount_sum"] = raw_dfs["amount"].rolling(windows_7d).sum()
-            derived_dfs["amount_sum"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            derived_dfs["amount_sum_7d"] = winsorize(
+                raw_dfs["amount"].rolling(windows_7d).sum()
+            )
+
+            rolling_median = derived_dfs["amount_sum_7d"].rolling(windows_60d).median()
+            derived_dfs["amount_7d_surge"] = np.log(
+                derived_dfs["amount_sum_7d"] / rolling_median.replace(0, np.nan)
+            )
+
             # derived_dfs["amount_sum"].fillna(0, inplace=True)
 
             k = windows_1d  # 6 hr lookback
             returns = raw_dfs["vwap"].pct_change()  # or absolute change
             vol = returns.rolling(k).std()
 
-            derived_dfs["vol_norm_mom"] = (
+            derived_dfs["vol_norm_mom"] = winsorize(
                 raw_dfs["vwap"] - raw_dfs["vwap"].shift(k)
             ) / vol.replace(0, np.nan)
 
             # volume momentum
-            derived_dfs["vol_momentum"] = (
-                raw_dfs["amount"] / raw_dfs["amount"].shift(windows_1d) - 1
+            derived_dfs["vol_momentum"] = winsorize(
+                (raw_dfs["amount"] / raw_dfs["amount"].shift(windows_1d)) - 1
             )
-            derived_dfs["vol_momentum"].replace([np.inf, -np.inf], np.nan, inplace=True)
             # derived_dfs["vol_momentum"].fillna(0, inplace=True)
 
             # buy ratio
-            derived_dfs["buy_ratio"] = raw_dfs["buy_volume"] / raw_dfs["volume"]
-            derived_dfs["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
+            derived_dfs["buy_ratio"] = raw_dfs["buy_volume"] / raw_dfs[
+                "volume"
+            ].replace(0, np.nan)
             # derived_dfs["buy_ratio"].fillna(0, inplace=True)
 
             # 24 hour return
-            derived_dfs["24hour_rtn"] = (
-                raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1d) - 1
+            derived_dfs["24hour_rtn"] = winsorize(
+                (raw_dfs["vwap"] / raw_dfs["vwap"].shift(windows_1d)) - 1
             )
-            derived_dfs["24hour_rtn"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # derived_dfs["24hour_rtn"].fillna(0, inplace=True)
 
             # squeeze ratio
             derived_dfs["squeeze_ratio"] = raw_dfs["bb_width"] / (
                 raw_dfs["keltner_upper"] - raw_dfs["keltner_lower"]
+            ).replace(0, np.nan)
+
+            # skew and kurt
+            derived_dfs["skew_24h_c"] = (
+                returns.rolling(windows_1d).skew().clip(-3, 3)
+            )  # 96 = 24h of 15-min bars
+            derived_dfs["kurt_24h_c"] = (
+                returns.rolling(windows_1d).kurt().clip(-1, 10)
+            )  # 96 = 24h of 15-min bars
+
+            # atr_pct
+            derived_dfs["atr_pct"] = raw_dfs["atr"] / raw_dfs["close_price"].replace(
+                0, np.nan
             )
 
             # garman-klass volatility
-            GK_WINDOW = windows_1h
-            log_hl = np.log(raw_dfs["high_price"] / raw_dfs["low_price"])  # log range
+            GK_WINDOW = windows_1d
+            log_hl = np.log(
+                raw_dfs["high_price"] / raw_dfs["low_price"].replace(0, np.nan)
+            )  # log range
             log_co = np.log(
-                raw_dfs["close_price"] / raw_dfs["open_price"]
+                raw_dfs["close_price"] / raw_dfs["open_price"].replace(0, np.nan)
             )  # log close-open
-
             rs = 0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2
-            derived_dfs["gk_vol"] = np.sqrt(rs.rolling(GK_WINDOW).mean())
+            gk_var_sum = rs.rolling(GK_WINDOW).sum().clip(lower=0)
+            gk_std_24h = np.sqrt(gk_var_sum)
+
+            derived_dfs["gk_vol"] = winsorize(gk_std_24h)
 
             # temporal features
             hourly = time_index.hour / 4  # put in 4-hour bins
@@ -1093,47 +1110,103 @@ class OptimizedModel:
                 {symbol: dow_cos for symbol in all_symbol_list}, index=time_index
             )
 
-            for ind, df in derived_dfs.items():
-                file = DERIVED_CACHE_FILES[ind]
-                print(f"Saving {ind} to cache, shape: {df.shape}")
+            for feature, df in derived_dfs.items():
+                file = DERIVED_CACHE_FILES[feature]
+                print(f"Saving {feature} to cache, shape: {df.shape}")
                 df.to_parquet(file)
-                print(f"Saved {ind} to cache at {file}")
+                print(f"Saved {feature} to cache at {file}")
+
+        # fast vol/flow features
+        FEATURES_TO_FAST_Z = [
+            "atr_pct",
+            "vwap_deviation",
+            "vol_momentum",
+            "gk_vol",
+        ]
+
+        # trend/momentum
+        FEATURES_TO_MED_Z = [
+            "close_price",
+            "1h_momentum",
+            "4h_momentum",
+            "7d_momentum",
+            "macd",
+            "cci",
+            "obv",
+        ]
+
+        # regime shape
+        FEATURES_TO_SLOW_Z = [
+            "skew_24h_c",
+            "kurt_24h_c",
+            "24hour_rtn",
+        ]
+
+        def rolling_z_scaling(df, window, min_periods):
+            """Apply rolling z-score scaling to a DataFrame."""
+            mean = df.rolling(window=window, min_periods=min_periods).mean()
+            std = df.rolling(window=window, min_periods=min_periods).std(ddof=0)
+            return (df - mean) / std
+
+        FAST_Z_WIN = 4 * 24 * 5  # 5 days
+        MEDIUM_Z_WIN = 4 * 24 * 20  # 20 days
+        SLOW_Z_WIN = 4 * 24 * 60  # 80 days
+
+        for features, z_window in zip(
+            (FEATURES_TO_FAST_Z, FEATURES_TO_MED_Z, FEATURES_TO_SLOW_Z),
+            (FAST_Z_WIN, MEDIUM_Z_WIN, SLOW_Z_WIN),
+        ):
+            for feature in features:
+                if feature in raw_dfs:
+                    df = raw_dfs[feature]
+                elif feature in derived_dfs:
+                    df = derived_dfs[feature]
+                else:
+                    print(f"Warning: {feature} not found in raw or derived data.")
+                    continue
+
+                print(f"Applying rolling z-score scaling to {feature}...")
+                derived_dfs[f"{feature}_rz"] = rolling_z_scaling(
+                    df, z_window, min_periods=z_window // 2
+                )
 
         raw_factors = [
             # "vwap",
-            "vwap_deviation",
-            "atr",
-            "macd",
+            # "atr",
+            "mfi",
             "rsi",
-            "bb_upper",
-            "bb_lower",
+            # "bb_upper",
+            # "bb_lower",
             "bb_width",
             "bb_dev",
             # "keltner_upper",
             # "keltner_lower",
-            "stochastic_d",
-            "cci",
-            "mfi",
-            "obv",
+            # "stochastic_d",
         ]
 
         derived_factors = [
-            "1h_momentum",
-            "4h_momentum",
-            "7d_momentum",
+            "macd_rz",
+            "cci_rz",
+            "obv_rz",
+            "vwap_deviation_rz",
+            # "1h_momentum_rz",
+            "4h_momentum_rz",
+            "7d_momentum_rz",
             # "log_return_1h",
             # "log_return_4h",
             # "log_return_7d",
-            "price_z",
             # "pct_change",
             "ult_osc",
-            "volume_z",
-            "amount_sum",
+            # "amount_sum_7d",
+            "amount_7d_surge",
             # "vol_norm_mom",
             "vol_momentum",
             "squeeze_ratio",
-            # "gk_vol",
-            "24hour_rtn",
+            "gk_vol_rz",
+            "skew_24h_c",
+            "kurt_24h_c",
+            "atr_pct_rz",
+            "24hour_rtn_rz",
             "buy_ratio",
             "hour_sin",
             "hour_cos",
@@ -1141,10 +1214,20 @@ class OptimizedModel:
             "dow_cos",
         ]
 
-        feature_dfs = {
-            **{key: raw_dfs[key] for key in raw_factors},
-            **{key: derived_dfs[key] for key in derived_factors},
-        }
+        features_dfs_to_use = {}
+        for key in raw_factors:
+            if key not in raw_dfs:
+                print(f"Warning: {key} not found in raw_dfs, skipping.")
+                continue
+
+            features_dfs_to_use[key] = raw_dfs[key]
+
+        for key in derived_factors:
+            if key not in derived_factors:
+                print(f"Warning: {key} not found in derived_dfs, skipping.")
+                continue
+
+            features_dfs_to_use[key] = derived_dfs[key]
 
         # ================
         # External indicators
@@ -1159,43 +1242,44 @@ class OptimizedModel:
         ]
         # market_inds = ["vwap", "rsi", "4h_momentum", "7d_momentum"]
         market_inds = [
-            "vwap_deviation",
+            "vwap_deviation_rz",
             "ult_osc",
             "rsi",
             # "vol_norm_mom",
             # "1h_momentum",
-            # "4h_momentum",
-            "7d_momentum",
+            "4h_momentum_rz",
+            "7d_momentum_rz",
         ]
 
         for factor in market_inds:
-            if factor not in feature_dfs:
+            if factor not in features_dfs_to_use:
                 print(f"Missing raw factor {factor}, cannot proceed.")
                 return
 
             for market_symbol in market_syms:
                 combined_col = None
 
-                if market_symbol not in feature_dfs[factor].columns:
+                if market_symbol not in features_dfs_to_use[factor].columns:
                     print(
                         f"Missing symbol {market_symbol} in factor {factor}, cannot proceed."
                     )
                     return
                 if combined_col is None:
-                    combined_col = feature_dfs[factor][market_symbol]
+                    combined_col = features_dfs_to_use[factor][market_symbol]
                 else:
-                    combined_col += feature_dfs[factor][market_symbol]
+                    combined_col += features_dfs_to_use[factor][market_symbol]
 
-            feature_dfs[f"btc_eth_agg_{factor}"] = pd.DataFrame(
+            features_dfs_to_use[f"btc_eth_agg_{factor}"] = pd.DataFrame(
                 {
                     symbol: combined_col if symbol not in market_syms else np.nan
                     for symbol in all_symbol_list
                 },
-                index=feature_dfs[factor].index,
+                index=features_dfs_to_use[factor].index,
             )
 
         # Calculate Beta
-        BETA_LOOKBACK_WINDOW = 90  # bars in your lookback, e.g. 90 day
+        BETA_LOOKBACK_WINDOW = MEDIUM_Z_WIN  # bars in lockback
+        BETA_Z_WINDOW = SLOW_Z_WIN
         BENCH_SYMBOL = "BTCUSDT"
 
         rets = raw_dfs["close_price"].pct_change()
@@ -1210,81 +1294,92 @@ class OptimizedModel:
 
         beta_df = rolling_cov.div(rolling_var, axis=0)
 
-        beta_z_df = beta_df.apply(
-            lambda col: (col - col.mean()) / col.std(ddof=0), axis=0
+        beta_z_df = rolling_z_scaling(
+            beta_df, BETA_Z_WINDOW, min_periods=BETA_Z_WINDOW // 2
         )
         beta_z_df = beta_z_df.drop(columns=[BENCH_SYMBOL], errors="ignore")
-        feature_dfs["btc_beta_z"] = beta_z_df.ffill()
+        features_dfs_to_use["btc_beta_z"] = beta_z_df.ffill()
 
-        # Add USDT features
-        print("Adding USDT to USD macro features...")
-        EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
+        # # Add USDT features
+        # print("Adding USDT to USD macro features...")
+        # EXTERNAL_DATA_DIR = os.path.join(BASE_DIR, "external_data")
 
-        try:
-            usdt_usd_df = get_single_symbol_kline_data(
-                "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
-            ).reindex(time_index, method="ffill")
+        # try:
+        #     usdt_usd_df = (
+        #         get_single_symbol_kline_data(
+        #             "USDT_USD", EXTERNAL_DATA_DIR, self.processing_device
+        #         )
+        #         .reindex(time_index)
+        #         .ffill()
+        #     )
 
-            # USDT is a 1:1 peg to USD
-            usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
+        #     print(f"Shape of USDT_USD data: after reindex {usdt_usd_df.shape}")
 
-            usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # usdt_usd_df["depeg"].fillna(0, inplace=True)
+        #     # USDT is a 1:1 peg to USD
+        #     usdt_usd_df["depeg"] = usdt_usd_df["close_price"] - 1.0
 
-            # USDT is a 1:1 peg to USD
-            # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
-            # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     usdt_usd_df["depeg"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["depeg"].fillna(0, inplace=True)
 
-            # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
-            # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # USDT is a 1:1 peg to USD
+        #     # usdt_usd_df["depeg_low"] = usdt_usd_df["low_price"] - 1.0
+        #     # usdt_usd_df["depeg_low"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-            usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
-            usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
-            # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
+        #     # usdt_usd_df["depeg_high"] = usdt_usd_df["high_price"] - 1.0
+        #     # usdt_usd_df["depeg_high"].replace([np.inf, -np.inf], np.nan, inplace=True)
 
-            usdt_usd_df["trade_intensity"] = (
-                (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
-                # .fillna(0)
-                .astype("float32")
-            )
+        #     usdt_usd_df["buy_ratio"] = usdt_usd_df["buy_volume"] / usdt_usd_df["volume"]
+        #     usdt_usd_df["buy_ratio"].replace([np.inf, -np.inf], np.nan, inplace=True)
+        #     # usdt_usd_df["buy_ratio"].fillna(0, inplace=True)
 
-            # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
-            # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
+        #     usdt_usd_df["trade_intensity"] = (
+        #         (usdt_usd_df["count"] / (usdt_usd_df["volume"].replace(0, np.nan)))
+        #         # .fillna(0)
+        #         .astype("float32")
+        #     )
 
-            # # Step 3: Z-score (avoid div/0)
-            # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
-            #     depeg_rolling_std.replace(0, np.nan)
-            # )
+        #     # depeg_rolling_mean = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).mean()
+        #     # depeg_rolling_std = usdt_usd_df["depeg"].rolling(Z_SCORE_WINDOW).std()
 
-            USDT_FEATURES = [
-                # "vwap",
-                "depeg",
-                # "depeg_z",
-                # "depeg_low",
-                # "depeg_high",
-                "buy_ratio",
-                "trade_intensity",
-            ]
+        #     # # Step 3: Z-score (avoid div/0)
+        #     # usdt_usd_df["depeg_z"] = (usdt_usd_df["depeg"] - depeg_rolling_mean) / (
+        #     #     depeg_rolling_std.replace(0, np.nan)
+        #     # )
 
-            for feature in USDT_FEATURES:
-                feature_dfs[f"usdt_{feature}"] = pd.DataFrame(
-                    {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
-                    index=usdt_usd_df[feature].index,
-                )
-        except Exception as e:
-            print(f"Error processing USDT_USD data: {e}, skipping")
-            raise
+        #     USDT_FEATURES = [
+        #         # "vwap",
+        #         "depeg",
+        #         # "depeg_z",
+        #         # "depeg_low",
+        #         # "depeg_high",
+        #         "buy_ratio",
+        #         "trade_intensity",
+        #     ]
 
-        feature_keys = list(feature_dfs.keys())
+        #     for feature in USDT_FEATURES:
+        #         features_dfs_to_use[f"usdt_{feature}"] = pd.DataFrame(
+        #             {symbol: usdt_usd_df[feature] for symbol in all_symbol_list},
+        #             index=usdt_usd_df[feature].index,
+        #         )
+        # except Exception as e:
+        #     print(f"Error processing USDT_USD data: {e}, skipping")
+        #     raise
+
+        keep_slice = slice(self.start_datetime, None)
+
+        for key, df in features_dfs_to_use.items():
+            features_dfs_to_use[key] = df.astype(np.float32).loc[keep_slice].ffill()
+
+        feature_keys = list(features_dfs_to_use.keys())
 
         print("Finished loading factors")
         print(f"Number of symbols: {len(all_symbol_list)}")
         print(f"Number of features: {len(feature_keys)}")
         print(f"Features: {feature_keys}")
 
-        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d)
+        df_target = derived_dfs["24hour_rtn"].shift(-windows_1d).loc[keep_slice]
 
-        self.train(df_target, feature_dfs)
+        self.train(df_target, features_dfs_to_use)
 
 
 if __name__ == "__main__":
