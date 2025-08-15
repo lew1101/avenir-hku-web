@@ -571,6 +571,7 @@ class OptimizedModel:
         TEST_SIZE = 4 * 24 * 365  # max training of 1 year data
         NUM_BOOST_ROUNDS = 1500
         EARLY_STOP_ROUNDS = 150
+        N_SPLITS = 5
 
         XGB_PARAMS = {
             "objective": "reg:pseudohubererror",
@@ -594,9 +595,10 @@ class OptimizedModel:
 
         times = X.index.get_level_values(0).to_numpy()
         uniq_times = np.unique(times)
-        tscv = TimeSeriesSplit(n_splits=6, gap=GAP, max_train_size=TEST_SIZE)
-        best_score = -np.inf
-        best_model = None
+        tscv = TimeSeriesSplit(n_splits=N_SPLITS, gap=GAP, max_train_size=TEST_SIZE)
+
+        models = []
+        scores = []
 
         for fold, (train_t_idx, val_t_idx) in enumerate(tscv.split(uniq_times), start=1):  # type: ignore
             print(f"Training fold {fold}...")
@@ -630,18 +632,24 @@ class OptimizedModel:
                 d_val,
                 iteration_range=(0, model.best_iteration + 1),
             )
+
             score = self.weighted_spearmanr(y_val, y_pred_val)
+            models.append(model)
+            scores.append(score)
             print(f"Fold {fold} - Weighted Spearman correlation {score:.4f}")
-            if score > best_score:
-                best_score = score
-                best_model = model
 
         elapsed_time = time.monotonic() - t0
         print(
             f"Training completed in {int(elapsed_time // 60)} min and {elapsed_time % 60:.1f} sec"
         )
 
-        print("Choosing best model and evaluating...")
+        print("Ensembling models and evaluating...")
+        # use all but the worst 2 models
+        best_models_idx = np.argsort(np.array(scores))[::-2]
+
+        best_models = [models[i] for i in best_models_idx]
+        models_n = len(best_models)
+
         BATCH_SIZE = 100_000
 
         n, m = X.shape
@@ -650,7 +658,7 @@ class OptimizedModel:
         SHAP_BATCH_IDX = total_batches // 2
 
         y_pred = np.zeros(n, dtype=np.float32)
-        shap_values = None
+        shap_values = None  # +1 for bias term
         shap_slice = None  # will hold slice(start, end) for the SHAP batch
 
         # Evaluated using in-sample prediction with batching to save memory (8gb vram, fuck)
@@ -662,23 +670,33 @@ class OptimizedModel:
             dmatrix = xgb.DMatrix(batch)
 
             if i == SHAP_BATCH_IDX:
-                shap_values = best_model.predict(
-                    dmatrix,
-                    pred_contribs=True,
-                    iteration_range=(0, best_model.best_iteration + 1),
-                )
-
+                shap_values = np.zeros((BATCH_SIZE, m + 1), dtype=np.float32)
                 shap_slice = slice(start, end)
-                y_pred[start:end] = shap_values.sum(axis=1, dtype=np.float32)
+
+                for model in best_models:
+                    model_shap = model.predict(
+                        dmatrix,
+                        pred_contribs=True,
+                        iteration_range=(0, model.best_iteration + 1),
+                    )
+
+                    y_pred[start:end] += model_shap.sum(axis=1, dtype=np.float32)
+                    shap_values += model_shap
+
+                y_pred[start:end] /= models_n
+                shap_values /= models_n
 
                 print(f"Evaluated SHAP using batch {i}/{total_batches}")
 
             else:
-                y_pred[start:end] = best_model.predict(
-                    dmatrix,
-                    pred_contribs=False,
-                    iteration_range=(0, best_model.best_iteration + 1),
-                ).astype(np.float32)
+                for model in best_models:
+                    y_pred[start:end] += model.predict(
+                        dmatrix,
+                        pred_contribs=False,
+                        iteration_range=(0, model.best_iteration + 1),
+                    ).astype(np.float32)
+
+                y_pred[start:end] /= models_n
 
                 print(f"Evaluated batch {i}/{total_batches}")
 
@@ -695,19 +713,21 @@ class OptimizedModel:
 
         SAVE_MODEL = True
         MODEL_DIR = "models"
-        MODEL_FILE_NAME = "best_xgb_model.json"
 
         if SAVE_MODEL:
             try:
                 os.makedirs(MODEL_DIR, exist_ok=True)  # keep saved models in a folder
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                full_path = os.path.join(MODEL_DIR, f"{timestamp}_{MODEL_FILE_NAME}")
 
-                print(f"Saving best model to {full_path}...")
-                best_model.save_model(full_path)
+                print(f"Saving best models to {MODEL_DIR}...")
+                for i, model in enumerate(best_models, start=1):
+                    save_path = os.path.join(
+                        MODEL_DIR, f"{timestamp}_model_fold{i}.json"
+                    )
+                    model.save_model(save_path)
                 print("Model saved successfully.")
             except Exception as e:
-                print(f"Error saving model: {e}")
+                print(f"Error saving models: {e}")
 
         OUTPUT_CSV = True
 
@@ -787,7 +807,7 @@ class OptimizedModel:
             # plt.show(block=False)
 
             xgb.plot_importance(
-                best_model,
+                best_models[0],
                 importance_type="gain",
                 max_num_features=MAX_NUM_FEATURES,
             )
